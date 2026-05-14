@@ -29,6 +29,55 @@ reading and modifying them through MCP tools.
 
 ---
 
+## Conflict semantics
+
+CouchDB uses optimistic concurrency: every write must include the current
+`_rev`, and stale writes are rejected with HTTP 409. Our server treats the
+database as a normal MVCC store and **does not implement any merge logic**.
+The existing LiveSync plugin on the user's devices already handles
+resolution.
+
+### What the server does
+
+- **Read-modify-write with retry-on-409.** For every update we GET the
+  doc, mutate it, PUT with the current `_rev`. If we get 409, re-fetch
+  and retry (cap at a small number of retries, e.g. 3).
+- **Set `mtime` correctly.** The auto-merger uses `mtime` to order
+  concurrent inserts and to break ties in JSON merges, so every write
+  stamps `mtime` with the current millisecond timestamp. Preserve
+  `ctime` from the existing doc on updates.
+- **Treat soft-deletes as terminal.** A read of a doc with
+  `deleted: true` returns `None` (note not found). Writes recreate it.
+
+### What the server does *not* do
+
+- **No three-way merging.** Even though we know how LiveSync does it (see
+  reference below), we don't reimplement it. Our writes are atomic from
+  CouchDB's perspective.
+- **No conflict creation by us alone.** A single client doing
+  read-modify-write cannot create a `_conflicts` entry — conflicts only
+  arise from replication. If the LiveSync plugin on a device later
+  syncs a divergent edit of a doc we wrote, CouchDB populates
+  `_conflicts`, and the *plugin's* `ConflictManager.tryAutoMerge` runs
+  on the next replication pass on the user's device.
+- **No interactive resolution.** If auto-merge fails on the device, the
+  user is prompted in Obsidian, exactly as they would be today.
+
+### Optional future feature
+
+- [ ] `list_conflicts()` — surface notes with non-empty `_conflicts` so an
+      LLM can summarize or help the user reason about them. Strictly
+      value-added; not required for the core read/write tools.
+
+### Reference
+
+- `src/lib/src/managers/ConflictManager.ts` — three-way merge and
+  per-line/per-key collision detection.
+- `src/modules/core/ReplicateResultProcessor.ts` — where conflicts are
+  picked up off the replication stream.
+
+---
+
 ## Requirements
 
 This is the running source of truth for what the server should do. Items
