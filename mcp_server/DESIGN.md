@@ -194,6 +194,19 @@ are tagged with status: `[ ]` planned, `[~]` in progress, `[x]` complete.
                                   └──────────────────┘
 ```
 
+## Deferred / backburner
+
+- **Local read cache.** A small SQLite cache keyed by `(path, rev)` storing
+  decoded note content would skip the chunk-fetch + decompress + decrypt
+  pipeline on repeated reads. Mostly worthwhile when the MCP server runs
+  on a different machine from CouchDB and round-trip latency is non-trivial;
+  for a co-located deployment the savings are negligible. Revisit if
+  profiling shows reads are a bottleneck.
+- **PouchDB-style local replica.** Explicitly rejected: PouchDB is JS-only,
+  bridging it from Python is expensive, and we don't need the offline /
+  conflict-resolution features it provides. A targeted cache (above) covers
+  the realistic performance need.
+
 ## Open questions
 
 - **Vector store choice.** Embedded (sqlite-vec, Chroma persistent, LanceDB)
