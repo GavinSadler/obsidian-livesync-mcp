@@ -1,4 +1,4 @@
-"""Search tools (keyword + semantic) exposed via MCP."""
+"""Search tools exposed via MCP."""
 
 from __future__ import annotations
 
@@ -9,37 +9,21 @@ from ..vector.store import VectorStore
 
 
 class SearchTools:
-    def __init__(self, repo: NoteRepository, vectors: VectorStore | None) -> None:
+    def __init__(self, repo: NoteRepository, vectors: VectorStore) -> None:
         self.repo = repo
         self.vectors = vectors
-
-    async def search_notes(
-        self,
-        query: str,
-        limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        """Keyword search by scanning note content."""
-        raise NotImplementedError
 
     async def semantic_search(
         self,
         query: str,
         top_k: int = 5,
         path_filter: str | None = None,
-    ) -> list[dict[str, Any]]:
-        raise NotImplementedError
+    ) -> dict[str, Any]:
+        """Vector similarity search over indexed note chunks.
 
-    async def find_related_notes(
-        self,
-        path: str,
-        top_k: int = 5,
-    ) -> list[dict[str, Any]]:
-        raise NotImplementedError
-
-    async def hybrid_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        keyword_weight: float = 0.3,
-    ) -> list[dict[str, Any]]:
+        Returns a dict with:
+          - results: list of {path, heading, snippet, score}
+          - index_coverage: {indexed, total} so the caller can tell
+            "no matches" from "index not yet built".
+        """
         raise NotImplementedError

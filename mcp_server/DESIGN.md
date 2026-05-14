@@ -63,12 +63,6 @@ resolution.
 - **No interactive resolution.** If auto-merge fails on the device, the
   user is prompted in Obsidian, exactly as they would be today.
 
-### Optional future feature
-
-- [ ] `list_conflicts()` — surface notes with non-empty `_conflicts` so an
-      LLM can summarize or help the user reason about them. Strictly
-      value-added; not required for the core read/write tools.
-
 ### Reference
 
 - `src/lib/src/managers/ConflictManager.ts` — three-way merge and
@@ -83,38 +77,33 @@ resolution.
 This is the running source of truth for what the server should do. Items
 are tagged with status: `[ ]` planned, `[~]` in progress, `[x]` complete.
 
+The MCP surface is intentionally small — **7 tools total**. Every tool
+description occupies LLM context, and tighter tool sets produce better
+tool-selection behavior. Internal state (indexing progress, encryption,
+chunking, etc.) is deliberately hidden from the LLM; it shows up only
+where it materially affects results.
+
 ### MCP tools — notes (CRUD)
 
-- [ ] `list_notes(path_prefix?, limit?, cursor?)` — list note paths in the
-      vault. Supports prefix filter for folder-style browsing.
+- [ ] `list_notes(path_prefix?, limit?)` — list note paths in the vault.
+      Supports prefix filter for folder-style browsing.
 - [ ] `read_note(path)` — read full markdown content of a note. Handles
       chunk reassembly, decompression, and decryption transparently.
-- [ ] `read_note_section(path, heading)` — return the content under a
-      specific markdown heading (parsed client-side from the full note).
 - [ ] `create_note(path, content)` — create a new note. Fails if the path
       already exists.
 - [ ] `update_note(path, content)` — overwrite the content of an existing
       note. Handles chunking + metadata updates.
 - [ ] `delete_note(path)` — soft-delete a note (sets `deleted: true`).
+- [ ] `move_note(old_path, new_path)` — rename/move a note. Atomic from
+      the caller's perspective; may be read + create + delete under the
+      hood.
 
 ### MCP tools — search
 
-- [ ] `search_notes(query, limit?)` — keyword search across note contents.
-      Client-side scan in the absence of native FTS.
 - [ ] `semantic_search(query, top_k?, path_filter?)` — vector similarity
-      search over indexed note chunks.
-- [ ] `find_related_notes(path, top_k?)` — find notes semantically similar
-      to a given note.
-- [ ] `hybrid_search(query, top_k?, keyword_weight?)` — combined keyword
-      and vector ranking. *(optional / stretch)*
-
-### MCP tools — vault & index
-
-- [ ] `get_vault_info()` — vault metadata: CouchDB endpoint, note count,
-      encryption mode, index status.
-- [ ] `index_status()` — number of notes indexed, embedding model, last
-      sync time, dimension.
-- [ ] `reindex_vault(force?)` — rebuild the vector index from scratch.
+      search over indexed note chunks. Response includes an
+      `index_coverage: {indexed, total}` field so the caller can tell
+      "no matches" from "index not yet built".
 
 ### LiveSync schema support
 
@@ -132,7 +121,11 @@ are tagged with status: `[ ]` planned, `[~]` in progress, `[x]` complete.
 
 ### Vector index
 
-- [ ] Background subscriber to CouchDB `_changes` feed (`since=now`,
+The index runs continuously in the background and is never directly
+visible to the LLM. The only place its state leaks into the API is the
+`index_coverage` field of `semantic_search` responses.
+
+- [ ] Background subscriber to CouchDB `_changes` feed (`since=<saved>`,
       `feed=continuous`).
 - [ ] On change: fetch updated note, chunk for embedding, embed, upsert
       into vector store.
@@ -144,6 +137,8 @@ are tagged with status: `[ ]` planned, `[~]` in progress, `[x]` complete.
 - [ ] Persistent watermark of last-seen `_changes` sequence so the indexer
       can resume cleanly across restarts.
 - [ ] Initial backfill on first start (or when index is empty).
+- [ ] Admin CLI command for forced full reindex (operator action, **not**
+      an MCP tool).
 
 ### Tooling & dev experience
 

@@ -23,10 +23,6 @@ class NoteTools:
     async def read_note(self, path: str) -> dict[str, Any]:
         raise NotImplementedError
 
-    async def read_note_section(self, path: str, heading: str) -> dict[str, Any]:
-        """Read content beneath a specific markdown heading."""
-        raise NotImplementedError
-
     async def create_note(self, path: str, content: str) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -34,4 +30,8 @@ class NoteTools:
         raise NotImplementedError
 
     async def delete_note(self, path: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def move_note(self, old_path: str, new_path: str) -> dict[str, Any]:
+        """Rename / move a note. Atomic from the LLM's perspective."""
         raise NotImplementedError

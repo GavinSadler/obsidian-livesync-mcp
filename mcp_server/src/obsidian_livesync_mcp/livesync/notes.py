@@ -50,3 +50,8 @@ class NoteRepository:
 
     async def delete(self, path: str) -> bool:
         raise NotImplementedError
+
+    async def move(self, old_path: str, new_path: str) -> Note:
+        """Move/rename a note. Implementation may be read + create + delete
+        under the hood; the public contract is atomic-on-success."""
+        raise NotImplementedError
