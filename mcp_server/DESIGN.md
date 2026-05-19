@@ -572,7 +572,83 @@ encryption, no compression. Just one doc update.
 
 ### `move_note`
 
-*(API definition pending — to be filled in.)*
+Rename or relocate a note. Internally a "create at new path, delete at
+old path" sequence. From the LLM's perspective: one call, one result.
+
+**What the LiveSync plugin does:** when an Obsidian user renames a file,
+the plugin's `watchVaultRename` (in `StorageEventManager.ts:636-656`)
+queues a DELETE then a CREATE — there is no dedicated rename op at the
+DB layer. `ctime` is taken from the file's post-rename filesystem stat,
+which means it's *fresh*, not preserved from the original. Chunks
+deduplicate naturally because chunk IDs are content-hash-derived, so
+identical content → identical chunks → existing chunks get reused.
+
+**What we do:** mirror the plugin's *result* exactly (fresh `ctime`, no
+special metadata, natural chunk dedup) but **reverse the order**:
+create-then-delete instead of delete-then-create. The plugin's
+delete-then-create order is safe because it queues both ops together
+in a persistent local queue that retries across crashes. We don't have
+that infrastructure, so the safer order — where worst-case partial
+failure leaves a duplicate (recoverable) instead of a hole (data loss)
+— is the right call.
+
+```python
+class MoveNoteInput(BaseModel):
+    """Move or rename a note. Bumps mtime; ctime is fresh (matches plugin)."""
+
+    old_path: str = Field(
+        description=(
+            "Current path of the note. Must point to an existing, "
+            "non-deleted note. Forward slashes, case-sensitive."
+        ),
+    )
+    new_path: str = Field(
+        description=(
+            "Destination path. Must end in '.md'. Must not already exist "
+            "(soft-deleted notes at this path are fine — they'll be "
+            "overwritten, matching create_note's resurrect behavior). "
+            "Parent folders are implicit. Backlinks pointing to old_path "
+            "elsewhere in the vault will NOT be updated — they'll break, "
+            "exactly as if a user renamed the file outside Obsidian."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model — content unchanged, `path` =
+`new_path`, `ctime` and `mtime` both = now (matching the plugin).
+
+**Errors:**
+- `NoteNotFoundError` — `old_path` doesn't exist or is soft-deleted.
+- `NoteAlreadyExistsError` — `new_path` exists and is not soft-deleted.
+- `InvalidPathError` — either path is malformed, OR `old_path == new_path`.
+- `MovePartialFailureError` — the create at `new_path` succeeded but the
+  delete at `old_path` failed. Error includes both paths so the LLM
+  knows the note now exists at both and can call `delete_note(old_path)`
+  itself to clean up.
+
+```mermaid
+flowchart TD
+    A[move_note old_path, new_path] --> B{both paths valid<br/>and different?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[GET old doc]
+    C --> D{old exists and not deleted?}
+    D -- no --> Y[NoteNotFoundError]
+    D -- yes --> E[GET new doc]
+    E --> F{new exists and not deleted?}
+    F -- yes --> Z[NoteAlreadyExistsError]
+    F -- no --> G[create_note flow at new_path<br/>with old content, fresh ctime/mtime]
+    G --> H{create succeeded?}
+    H -- no --> W[propagate create error]
+    H -- yes --> I[delete_note flow at old_path]
+    I --> J{delete succeeded?}
+    J -- no --> V[MovePartialFailureError<br/>note now at both paths]
+    J -- yes --> K[Return new Note]
+```
+
+**Why not "in-place rename" (just change `path` on the doc)?**
+LiveSync's doc IDs are derived from path (see `livesync/paths.py`), so
+"renaming" means writing a new doc at a new ID anyway — CouchDB can't
+change a doc's `_id`. It's create + delete with extra steps.
 
 ### `semantic_search`
 
