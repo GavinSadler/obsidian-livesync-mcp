@@ -198,8 +198,12 @@ class Note(BaseModel):
 
 ### `list_notes`
 
-Browse notes in the vault, optionally scoped to a folder. Supports
-offset-based pagination so the LLM can iterate large folders.
+Browse notes in the vault, optionally scoped to a folder. Intentionally
+**not paginated** — most folders contain few enough notes to return in
+one call, and the LLM's primary discovery tool for large vaults is
+`semantic_search` anyway. If a folder is genuinely larger than the
+limit, the LLM should narrow its filter or switch to semantic search
+rather than iterate.
 
 ```python
 class ListNotesInput(BaseModel):
@@ -214,22 +218,14 @@ class ListNotesInput(BaseModel):
             "Paths are case-sensitive and use forward slashes."
         ),
     )
-    offset: int = Field(
-        default=0,
-        ge=0,
-        description=(
-            "Number of notes to skip before returning results. "
-            "Use 0 for the first batch, then offset+limit for the next, "
-            "and so on. If offset >= total, the result will be empty."
-        ),
-    )
     limit: int = Field(
-        default=100,
+        default=1000,
         ge=1,
-        le=1000,
+        le=5000,
         description=(
-            "Maximum notes to return in this call. "
-            "Defaults to 100; cap is 1000."
+            "Maximum notes to return. Defaults to 1000; cap is 5000. "
+            "If you hit the limit and need more, narrow the folder filter "
+            "or use semantic_search instead of trying to enumerate."
         ),
     )
 
@@ -253,30 +249,25 @@ class NoteListItem(BaseModel):
 
 
 class ListNotesOutput(BaseModel):
-    """A page of notes, ordered lexicographically by path."""
+    """Notes matching the filter, ordered lexicographically by path."""
 
     notes: list[NoteListItem] = Field(
         description=(
             "Matching notes, sorted by path (case-sensitive lexicographic). "
-            "Ordering is stable across calls, which makes offset pagination "
-            "reliable. Will be empty if no notes match or offset is past the end."
+            "May be truncated to `limit` items — check `total` to know."
         ),
     )
     total: int = Field(
         ge=0,
         description=(
-            "Total notes matching the folder filter at the time of this call. "
-            "Compare against offset to decide whether to paginate again. "
-            "Note: total may change between calls if notes are created or "
-            "deleted concurrently — treat it as informational, not exact."
+            "Total notes matching the folder filter (independent of limit). "
+            "If total > len(notes), the result was truncated. "
+            "Narrow the folder or use semantic_search to find what you need."
         ),
     )
 ```
 
-**Errors:** none. Empty `notes` array on no matches or out-of-range offset.
-
-**Pagination flow:** call with `offset=0`, then `offset += limit`, until
-`len(notes) < limit` or `offset >= total`.
+**Errors:** none. Empty `notes` array if nothing matches.
 
 ```mermaid
 sequenceDiagram
@@ -284,23 +275,16 @@ sequenceDiagram
     participant Server as MCP Server
     participant DB as CouchDB
 
-    LLM->>Server: list_notes(folder="projects/", offset=0, limit=100)
+    LLM->>Server: list_notes(folder="projects/", limit=1000)
     Server->>DB: _all_docs with key range [folder, folder + "￿")
-    DB-->>Server: 100 docs + total count
-    Server-->>LLM: { notes: [100], total: 543 }
-    Note over LLM: total > offset+limit, want more
+    DB-->>Server: all matching docs + total count
+    Server-->>LLM: { notes: [n ≤ limit], total: N }
 
-    LLM->>Server: list_notes(folder="projects/", offset=100, limit=100)
-    Server->>DB: _all_docs with skip=100
-    DB-->>Server: 100 docs + total
-    Server-->>LLM: { notes: [100], total: 543 }
-    Note over LLM: keep going...
-
-    LLM->>Server: list_notes(folder="projects/", offset=500, limit=100)
-    Server->>DB: _all_docs with skip=500
-    DB-->>Server: 43 docs + total
-    Server-->>LLM: { notes: [43], total: 543 }
-    Note over LLM: len(notes) < limit → done
+    alt total ≤ limit
+        Note over LLM: Got everything, done.
+    else total > limit
+        Note over LLM: Truncated. Narrow the folder<br/>or call semantic_search.
+    end
 ```
 
 ### `read_note`
