@@ -498,7 +498,77 @@ flowchart TD
 
 ### `delete_note`
 
-*(API definition pending — to be filled in.)*
+Soft-delete a note. The doc remains in CouchDB with `deleted: true`,
+matching LiveSync's normal delete behavior. The deletion can be undone
+later by calling `create_note` at the same path (resurrection).
+
+```python
+class DeleteNoteInput(BaseModel):
+    """Soft-delete a note. The doc remains in CouchDB as a tombstone."""
+
+    path: str = Field(
+        description=(
+            "Path of the note to delete, relative to vault root. "
+            "Must point to an existing, non-deleted note. "
+            "After deletion, read_note and list_notes will treat this "
+            "path as not-existing. The deletion can later be undone by "
+            "calling create_note at the same path (resurrection)."
+        ),
+    )
+
+
+class DeleteNoteOutput(BaseModel):
+    """Confirmation that a note has been soft-deleted."""
+
+    path: str = Field(
+        description="Path of the deleted note (echoed from input).",
+    )
+    deleted: bool = Field(
+        default=True,
+        description=(
+            "Always true on success. Included for clarity so the LLM "
+            "has an unambiguous confirmation field rather than an empty body."
+        ),
+    )
+```
+
+**Errors:**
+- `NoteNotFoundError` — path doesn't exist, or note is already soft-deleted.
+  The end state is the same either way, but the error signals stale state
+  to the LLM.
+- `InvalidPathError` — path is malformed.
+- `NoteWriteError` — retried writes hit 409 N times in a row.
+
+**Behavior:**
+- Uses LiveSync's `deleted: true` flag, not CouchDB's native `_deleted`.
+  The doc lives on; LiveSync's maintenance task GC's orphan chunks later.
+- The `children` array is **preserved** on delete. Two reasons:
+  reversibility (a replica with intact chunks can restore the note via
+  replication), and there's no correctness benefit to clearing it.
+- `ctime` is preserved; `mtime` is bumped to the deletion time.
+- No `purge` option. CouchDB `_purge` is a maintenance operation, not an
+  LLM-accessible action.
+
+```mermaid
+flowchart TD
+    A[delete_note path] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path → doc ID]
+    C --> D[GET existing doc]
+    D --> E{exists?}
+    E -- no --> Y[NoteNotFoundError]
+    E -- yes --> F{deleted: true?}
+    F -- yes --> Y
+    F -- no --> G[prepare tombstone doc<br/>set deleted=true, mtime=now<br/>preserve children & ctime<br/>chain off current _rev]
+    G --> H[PUT updated doc to CouchDB]
+    H --> I{409 conflict?}
+    I -- yes, retries < 3 --> D
+    I -- yes, exhausted --> Z[NoteWriteError]
+    I -- no --> J[Return DeleteNoteOutput]
+```
+
+Much simpler than create/update at the DB layer — no chunking, no
+encryption, no compression. Just one doc update.
 
 ### `move_note`
 
