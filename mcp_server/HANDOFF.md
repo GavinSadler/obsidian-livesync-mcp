@@ -21,8 +21,11 @@ This is a snapshot of progress on the MVP MCP server, written so you
 ### MVP implementation (in `mcp_server/src/obsidian_livesync_mcp/`)
 - `livesync/paths.py` — plain mode + obfuscated (`f:`) mode with
   SHA-256 stretching. *Obfuscated mode needs real-vault verification.*
-- `livesync/chunks.py` — line-aware splitter (max 1000 chars/chunk),
-  XXHash64 chunk IDs in base36 (matches plugin default config).
+- `livesync/chunks.py` — verbatim port of `splitPieces2V2`'s text path
+  from `livesync-commonlib` (UTF-16-aware length counting, dynamic min
+  chunk scaling, trailing-empty-chunk semantics). 14/14 parity fixtures
+  match the JS reference byte-for-byte. XXHash64 chunk IDs in base36
+  with UTF-16 length in the hash payload.
 - `livesync/encryption.py` — deflate compression (`~` marker) and HKDF
   V2 encryption (`%=` marker) implemented via the `cryptography`
   library. Read support for `%$` ephemeral-salt HKDF too. Legacy `%`
@@ -45,13 +48,15 @@ This is a snapshot of progress on the MVP MCP server, written so you
   `obsidian-livesync-mcp` console script is wired up.
 - `config.py` — `load_settings()` reads from env / `.env`.
 
-### Tests (71 total, all passing)
+### Tests (77 total, all passing)
 - `tests/fake_couch.py` — in-memory `CouchDBClient` stand-in with
   realistic MVCC semantics (rev tracking, 409 on stale writes).
 - `test_paths.py` (11) — plain & obfuscated round-trips, leading-`_`
   guard, fallback-path requirement, determinism, passphrase variance.
-- `test_chunks.py` (9) — split/assemble round-trip, max-size enforcement,
-  hard-split for long lines, hash stability + prefix.
+- `test_chunks.py` (15) — split/assemble round-trip, dynamic min-size
+  scaling, plain_split=False fixed slicing, unicode handling, hash
+  stability + prefix, **14-fixture byte-identical parity test vs the
+  JS reference** (`scripts/splitref.mjs`).
 - `test_encryption.py` (24) — wire-format constants pinned; marker
   detection; PBKDF2 / HKDF derivation correctness + determinism; HKDF
   encrypt/decrypt round-trips (ASCII, unicode, empty); layout sanity;
@@ -88,11 +93,11 @@ This is a snapshot of progress on the MVP MCP server, written so you
   `/tmp/octagonal-wheels/src/encryption/hkdf.ts`; risk is parameter
   drift, not the crypto itself.
 - **Docker image.** A Dockerfile + GHA release workflow.
-- **Splitter parity.** Our line-aware splitter doesn't match
-  `ContentSplitterV2`'s output (lives in `livesync-commonlib` —
-  `src/lib/src/string_and_binary/chunks.ts`). Content round-trips fine,
-  but chunks won't dedup with plugin-written notes. Port
-  `splitPieces2V2` faithfully.
+- **Splitter parity validation against a real vault.** The Python port
+  of `splitPieces2V2` matches the JS reference byte-for-byte on 14
+  hand-crafted inputs (including non-BMP characters and trailing-
+  newline edge cases). A real-vault round-trip would confirm there
+  are no remaining gaps the synthetic fixtures don't cover.
 
 ### Lower-priority
 - **Legacy "%" (PBKDF2) and "%~" (V3) encryption read support.**

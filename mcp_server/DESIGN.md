@@ -114,8 +114,10 @@ where it materially affects results.
 - [x] Path → document ID encoding (obfuscated `f:` mode, SHA-256 stretched).
       *(Implemented; needs real-vault verification — see Known gaps.)*
 - [x] Chunk reassembly from `children[]` references.
-- [x] Note write path: content splitting, chunk hashing (`h:` IDs via
-      XXHash64 + base36), parent doc with `children[]` and empty `eden` field.
+- [x] Note write path: content splitting (verbatim port of
+      `splitPieces2V2`'s text path, UTF-16-aware so chunks dedup with
+      plugin-written notes), chunk hashing (`h:` IDs via XXHash64 +
+      base36), parent doc with `children[]` and empty `eden` field.
 - [x] Soft-delete via `deleted: true`.
 - [x] Compression / decompression (deflate via stdlib `zlib`, `~` marker).
 - [x] Encryption V2 (HKDF, `%=` marker) — read & write. Implemented via
