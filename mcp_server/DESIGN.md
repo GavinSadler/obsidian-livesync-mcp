@@ -151,6 +151,186 @@ visible to the LLM. The only place its state leaks into the API is the
 
 ---
 
+## API reference
+
+Detailed input/output schemas for each MCP tool. Field descriptions here
+are normative — the MCP SDK translates these Pydantic models into a JSON
+Schema that the LLM sees verbatim, so wording matters.
+
+### Cross-cutting conventions
+
+- **Schema mechanism:** Pydantic models. The MCP Python SDK auto-generates
+  JSON Schema from them.
+- **Timestamps:** ISO 8601 strings, UTC (e.g. `"2026-05-14T10:30:00Z"`).
+  LiveSync stores unix-ms internally; we convert at the boundary.
+- **Errors:** typed exceptions, surfaced as structured MCP tool errors.
+  Common ones:
+  - `NoteNotFoundError` — path doesn't exist or is soft-deleted.
+  - `NoteAlreadyExistsError` — path already exists when it shouldn't.
+  - `InvalidPathError` — path malformed (empty, contains `..`, leading `/`,
+    etc.).
+- **Paths:** plain `str`, forward slashes, case-sensitive, relative to vault
+  root. No leading slash. Must end in `.md` for create operations.
+- **Shared `Note` model:** the return type for `read_note`, `create_note`,
+  `update_note`, and `move_note`.
+
+```python
+class Note(BaseModel):
+    """A note's full content and metadata."""
+
+    path: str = Field(description="Path of the note (echoed from input).")
+    content: str = Field(
+        description=(
+            "Full markdown content as UTF-8 text. "
+            "Includes any YAML frontmatter at the top, verbatim. "
+            "Whitespace and line endings preserved as stored."
+        ),
+    )
+    ctime: datetime = Field(description="Creation time (ISO 8601, UTC).")
+    mtime: datetime = Field(
+        description="Last modification time (ISO 8601, UTC).",
+    )
+    size_bytes: int = Field(
+        ge=0,
+        description="Plaintext size of the note in bytes (UTF-8).",
+    )
+```
+
+### `list_notes`
+
+Browse notes in the vault, optionally scoped to a folder. Supports
+offset-based pagination so the LLM can iterate large folders.
+
+```python
+class ListNotesInput(BaseModel):
+    """List notes in the vault, optionally scoped to a folder."""
+
+    folder: str | None = Field(
+        default=None,
+        description=(
+            "Optional folder to list notes from, recursively. "
+            "Examples: 'projects/', 'daily/2026/'. A trailing slash is "
+            "added if missing. Null or empty means list from the vault root. "
+            "Paths are case-sensitive and use forward slashes."
+        ),
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of notes to skip before returning results. "
+            "Use 0 for the first batch, then offset+limit for the next, "
+            "and so on. If offset >= total, the result will be empty."
+        ),
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description=(
+            "Maximum notes to return in this call. "
+            "Defaults to 100; cap is 1000."
+        ),
+    )
+
+
+class NoteListItem(BaseModel):
+    """A single note's summary for listing."""
+
+    path: str = Field(
+        description=(
+            "File path relative to the vault root. "
+            "Examples: 'README.md', 'daily/2026-05-14.md'."
+        ),
+    )
+    mtime: datetime = Field(
+        description="Last modification time (ISO 8601, UTC).",
+    )
+    size_bytes: int = Field(
+        ge=0,
+        description="Plaintext size of the note in bytes.",
+    )
+
+
+class ListNotesOutput(BaseModel):
+    """A page of notes, ordered lexicographically by path."""
+
+    notes: list[NoteListItem] = Field(
+        description=(
+            "Matching notes, sorted by path (case-sensitive lexicographic). "
+            "Ordering is stable across calls, which makes offset pagination "
+            "reliable. Will be empty if no notes match or offset is past the end."
+        ),
+    )
+    total: int = Field(
+        ge=0,
+        description=(
+            "Total notes matching the folder filter at the time of this call. "
+            "Compare against offset to decide whether to paginate again. "
+            "Note: total may change between calls if notes are created or "
+            "deleted concurrently — treat it as informational, not exact."
+        ),
+    )
+```
+
+**Errors:** none. Empty `notes` array on no matches or out-of-range offset.
+
+**Pagination flow:** call with `offset=0`, then `offset += limit`, until
+`len(notes) < limit` or `offset >= total`.
+
+### `read_note`
+
+Fetch a single note's full content. Notes are typically 1-20 KB in
+Obsidian; partial-read parameters are intentionally omitted because the
+edge case (multi-megabyte notes) is rare and would add complexity to
+every call.
+
+```python
+class ReadNoteInput(BaseModel):
+    """Read a single note's full content by path."""
+
+    path: str = Field(
+        description=(
+            "Path to the note relative to the vault root. "
+            "Examples: 'README.md', 'daily/2026-05-14.md'. "
+            "Paths are case-sensitive and use forward slashes."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model.
+
+**Errors:**
+- `NoteNotFoundError` — path doesn't exist or is soft-deleted (the LLM
+  cannot distinguish these cases; both look like "no note here").
+- `InvalidPathError` — path is malformed.
+
+**Safety net (internal):** a runtime cap (e.g. 5 MB) refuses to return
+unreasonably large notes to protect server memory. Not part of the
+public API; surfaces as a clear error if ever hit.
+
+### `create_note`
+
+*(API definition pending — to be filled in.)*
+
+### `update_note`
+
+*(API definition pending — to be filled in.)*
+
+### `delete_note`
+
+*(API definition pending — to be filled in.)*
+
+### `move_note`
+
+*(API definition pending — to be filled in.)*
+
+### `semantic_search`
+
+*(API definition pending — to be filled in.)*
+
+---
+
 ## Architecture sketch
 
 ```
