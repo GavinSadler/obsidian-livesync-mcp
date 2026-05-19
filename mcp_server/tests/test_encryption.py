@@ -8,6 +8,11 @@ from obsidian_livesync_mcp.livesync.encryption import (
     COMPRESSION_MARKER,
     ENCRYPTION_MARKER_V1,
     ENCRYPTION_MARKER_V2,
+    EncryptionNotSupportedError,
+    compress,
+    decompress,
+    decrypt,
+    encrypt,
     is_compressed,
     is_encrypted,
 )
@@ -22,22 +27,28 @@ def test_marker_detection() -> None:
     assert not is_compressed("plain payload")
 
 
-@pytest.mark.skip(reason="encrypt/decrypt not implemented yet")
-def test_encrypt_decrypt_roundtrip(sample_passphrase: str) -> None:
-    from obsidian_livesync_mcp.livesync.encryption import decrypt, encrypt
-
-    plaintext = "secret data"
-    ciphertext = encrypt(plaintext, sample_passphrase)
-    assert ciphertext != plaintext
-    assert is_encrypted(ciphertext)
-    assert decrypt(ciphertext, sample_passphrase) == plaintext
+def test_encrypt_raises_until_implemented() -> None:
+    # MVP doesn't support encryption — should raise a clear error so
+    # the user knows to disable E2EE in plugin settings.
+    with pytest.raises(EncryptionNotSupportedError):
+        encrypt("plaintext", "passphrase")
+    with pytest.raises(EncryptionNotSupportedError):
+        decrypt("%=ciphertext", "passphrase")
 
 
-@pytest.mark.skip(reason="compress/decompress not implemented yet")
 def test_compress_decompress_roundtrip() -> None:
-    from obsidian_livesync_mcp.livesync.encryption import compress, decompress
-
     plaintext = "a" * 1000
     compressed = compress(plaintext)
     assert is_compressed(compressed)
+    assert len(compressed) < len(plaintext)  # actually compressed
     assert decompress(compressed) == plaintext
+
+
+def test_compress_handles_unicode() -> None:
+    plaintext = "Hello, 世界! 🌍\n" * 50
+    compressed = compress(plaintext)
+    assert decompress(compressed) == plaintext
+
+
+def test_decompress_passthrough_for_uncompressed() -> None:
+    assert decompress("plain string") == "plain string"
