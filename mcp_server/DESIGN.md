@@ -278,6 +278,31 @@ class ListNotesOutput(BaseModel):
 **Pagination flow:** call with `offset=0`, then `offset += limit`, until
 `len(notes) < limit` or `offset >= total`.
 
+```mermaid
+sequenceDiagram
+    participant LLM
+    participant Server as MCP Server
+    participant DB as CouchDB
+
+    LLM->>Server: list_notes(folder="projects/", offset=0, limit=100)
+    Server->>DB: _all_docs with key range [folder, folder + "￿")
+    DB-->>Server: 100 docs + total count
+    Server-->>LLM: { notes: [100], total: 543 }
+    Note over LLM: total > offset+limit, want more
+
+    LLM->>Server: list_notes(folder="projects/", offset=100, limit=100)
+    Server->>DB: _all_docs with skip=100
+    DB-->>Server: 100 docs + total
+    Server-->>LLM: { notes: [100], total: 543 }
+    Note over LLM: keep going...
+
+    LLM->>Server: list_notes(folder="projects/", offset=500, limit=100)
+    Server->>DB: _all_docs with skip=500
+    DB-->>Server: 43 docs + total
+    Server-->>LLM: { notes: [43], total: 543 }
+    Note over LLM: len(notes) < limit → done
+```
+
 ### `read_note`
 
 Fetch a single note's full content. Notes are typically 1-20 KB in
@@ -308,6 +333,29 @@ class ReadNoteInput(BaseModel):
 **Safety net (internal):** a runtime cap (e.g. 5 MB) refuses to return
 unreasonably large notes to protect server memory. Not part of the
 public API; surfaces as a clear error if ever hit.
+
+**Read flow (internal):**
+
+```mermaid
+flowchart TD
+    A[read_note path] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path to doc ID]
+    C --> D[GET note doc from CouchDB]
+    D --> E{found?}
+    E -- 404 --> Y[NoteNotFoundError]
+    E -- yes --> F{deleted: true?}
+    F -- yes --> Y
+    F -- no --> G[_bulk_get all child chunk docs]
+    G --> H{any chunk encrypted?}
+    H -- yes --> I[decrypt each with passphrase]
+    H -- no --> J
+    I --> J{any chunk compressed?}
+    J -- yes --> K[deflate-decompress each]
+    J -- no --> L
+    K --> L[concatenate chunks in children-array order]
+    L --> M[return Note]
+```
 
 ### `create_note`
 
