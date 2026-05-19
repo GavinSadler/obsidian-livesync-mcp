@@ -836,6 +836,63 @@ flowchart TD
   conflict-resolution features it provides. A targeted cache (above) covers
   the realistic performance need.
 
+## Known gaps & compatibility risks
+
+Tracked here so we don't lose them. These all need resolution before we
+can claim full round-trip compatibility with the LiveSync plugin.
+
+### Hard limitations of the MVP
+
+- **No encryption support.** V2 (HKDF, `%=`) and V1 (PBKDF2, `%`) are both
+  unimplemented. The exact key derivation, IV handling, AES mode, and wire
+  format live in the JavaScript-only `octagonal-wheels` library, which has
+  no Python port. **The vault must have "End-to-End Encryption" disabled**
+  in the LiveSync plugin settings for the MCP server to work. Reads of
+  encrypted chunks will fail with a clear error; writes from the MCP server
+  will be unencrypted (which would mix with encrypted data and corrupt the
+  vault — so the server refuses to start if a passphrase is configured for
+  a vault that appears encrypted).
+
+### Unresolved spec questions (need real-vault verification)
+
+- **Path obfuscation stretching loop.** `path.ts` calls SHA-256 in a loop
+  `key.length` times when deriving the obfuscated ID. The exact semantics
+  of `key.length` (is `key` the passphrase string? a derived byte array?)
+  aren't clear from the TS alone — verify with a known-input known-output
+  pair from a real obfuscated vault before claiming compatibility.
+
+- **Compression marker.** Two markers appear in the TS source: `~`
+  (referenced widely in older code) and `\u{000E}LZ\u{001D}`
+  (`MARK_SHIFT_COMPRESSED` in current `compress.ts`). The relationship —
+  whether one supersedes the other, or they coexist on different code
+  paths — is not obvious. Our writes should match whichever marker the
+  plugin currently produces for new chunks. Verify with a real vault.
+
+- **HKDF parameters.** If we ever add encryption support: the exact info
+  string, output length, AES mode (GCM vs CBC), IV derivation, and
+  ciphertext+tag concatenation order are all hidden inside
+  `octagonal-wheels`. Either trace through that library or do
+  interop round-trip tests; don't guess.
+
+- **Hash algorithm selection.** The plugin supports XXHash64 (default),
+  SHA1, and a pure-JS mixed hash. We implement XXHash64 only. If a user
+  has an unusual config, our chunk IDs won't match theirs and chunk
+  dedup with their existing data will silently fail. Detect and refuse
+  to write in that case, or document the requirement.
+
+- **Eden field.** Plugin sets `eden: {}` on unencrypted writes; the
+  encryption layer populates it on encrypted writes. We always write
+  `{}`. Should be fine for non-encrypted vaults but verify nothing in
+  the plugin's read path expects a specific shape.
+
+### Verification deferred
+
+- **No integration tests against a real vault.** All tests are unit
+  tests against the spec as we understand it from the TS source. Before
+  declaring this server "compatible," set up a local Docker CouchDB +
+  an Obsidian instance with LiveSync, do round-trip writes from both
+  sides, and verify the plugin can read what we wrote and vice versa.
+
 ## Open questions
 
 - **Vector store choice.** Embedded (sqlite-vec, Chroma persistent, LanceDB)

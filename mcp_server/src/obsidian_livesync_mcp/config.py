@@ -50,4 +50,8 @@ class Settings(BaseSettings):
 
 def load_settings() -> Settings:
     """Load settings from environment / .env file."""
-    raise NotImplementedError
+    return Settings(
+        couchdb=CouchDBSettings(),  # type: ignore[call-arg]
+        livesync=LiveSyncSettings(),
+        vector=VectorSettings(),
+    )
