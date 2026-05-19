@@ -162,6 +162,13 @@ All should pass cleanly. CI runs the same checks on push.
 
 ## Gotchas to know about
 
+- **Internal `Note` vs. MCP `NoteModel`.** The skeleton's `Note` dataclass
+  (in `livesync/notes.py`) stores raw content including frontmatter;
+  the `NoteModel` Pydantic class (in `tools/models.py`) is what the LLM
+  sees and splits frontmatter into a separate field via
+  `NoteModel.from_repo_note(note)`. DESIGN.md describes the MCP schema
+  (what the LLM sees), not the internal representation.
+
 - **CWD discipline**: ruff format from a wide directory will reformat
   unrelated files (the `.ipynb` at the repo root got reformatted once
   in this session — reverted in a follow-up commit). Always run ruff
