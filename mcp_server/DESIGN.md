@@ -420,7 +420,81 @@ flowchart TD
 
 ### `update_note`
 
-*(API definition pending — to be filled in.)*
+Overwrite an existing note's content. Strict — fails if the note doesn't
+exist (use `create_note` for that). A soft-deleted note at the path is
+treated as "not found" for consistency with `read_note`.
+
+```python
+class UpdateNoteInput(BaseModel):
+    """Update an existing note's content. Strict — does not create new notes."""
+
+    path: str = Field(
+        description=(
+            "Path of the note to update, relative to vault root. "
+            "Must point to an existing, non-deleted note. "
+            "Use create_note for new notes; soft-deleted notes are not "
+            "considered to exist for the purposes of this tool."
+        ),
+    )
+    content: str = Field(
+        description=(
+            "New full markdown content. Replaces the entire note body. "
+            "May be empty. May include YAML frontmatter, verbatim. "
+            "Transparently chunked, compressed, and encrypted on write."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model — `ctime` preserved from the original,
+`mtime` set to now.
+
+**Errors:**
+- `NoteNotFoundError` — path doesn't exist, or note is soft-deleted.
+  Use `create_note` to write a new (or resurrected) note at this path.
+- `InvalidPathError` — path is malformed.
+- `NoteWriteError` — internal: retried writes hit 409 N times in a row.
+
+**Behavior:**
+- `ctime` is preserved; `mtime` is bumped to now.
+- Old chunks become orphans; LiveSync's `purgeUnreferencedChunks` GC's them.
+- No conditional update (no `expected_mtime`); 409s are handled by an
+  internal retry loop. We can revisit if real concurrency issues surface.
+- No-op writes (new content == old content) still go through — the
+  caller asked for a write, `mtime` bump is a real signal.
+- Structurally identical to `create_note` at the DB layer; only the
+  preconditions differ.
+
+| Precondition | `create_note` | `update_note` |
+|---|---|---|
+| Doc doesn't exist | ✓ proceed | ✗ NoteNotFoundError |
+| Doc exists, not deleted | ✗ AlreadyExists | ✓ proceed |
+| Doc exists, soft-deleted | ✓ proceed (resurrect) | ✗ NoteNotFoundError |
+
+```mermaid
+flowchart TD
+    A[update_note path, content] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path → doc ID]
+    C --> D[GET existing doc]
+    D --> E{exists?}
+    E -- no --> Y[NoteNotFoundError]
+    E -- yes --> F{deleted: true?}
+    F -- yes --> Y
+    F -- no --> G[prepare updated doc<br/>preserve ctime, mtime=now<br/>chain off current _rev]
+    G --> H[split new content into chunks]
+    H --> I{encryption enabled?}
+    I -- yes --> J[encrypt each chunk]
+    I -- no --> K
+    J --> K{compression enabled?}
+    K -- yes --> L[deflate each chunk]
+    K -- no --> M
+    L --> M[hash each chunk → 'h:' IDs]
+    M --> N[_bulk_docs: write new chunks + parent doc]
+    N --> O{409 conflict?}
+    O -- yes, retries < 3 --> D
+    O -- yes, exhausted --> Z[NoteWriteError]
+    O -- no --> P[Return Note]
+```
 
 ### `delete_note`
 
