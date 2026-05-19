@@ -212,7 +212,7 @@ Schema that the LLM sees verbatim, so wording matters.
 - **Paths:** plain `str`, forward slashes, case-sensitive, relative to vault
   root. No leading slash. Must end in `.md` for create operations.
 - **Shared `Note` model:** the return type for `read_note`, `create_note`,
-  `update_note`, and `move_note`.
+  `update_note`, `append_note`, and `move_note`.
 
 ```python
 class Note(BaseModel):
@@ -221,9 +221,24 @@ class Note(BaseModel):
     path: str = Field(description="Path of the note (echoed from input).")
     content: str = Field(
         description=(
-            "Full markdown content as UTF-8 text. "
-            "Includes any YAML frontmatter at the top, verbatim. "
-            "Whitespace and line endings preserved as stored."
+            "Markdown content as UTF-8 text. "
+            "YAML frontmatter (if present) has been stripped into the `frontmatter` field. "
+            "Whitespace and line endings in the body are preserved as stored."
+        ),
+    )
+    frontmatter: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Parsed YAML frontmatter from the top of the note. "
+            "None if the note has no frontmatter or if parsing failed. "
+            "Commonly includes metadata like tags, keywords, created, etc."
+        ),
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tags extracted from frontmatter (tags or keywords fields). "
+            "None if no tags found. Lowercase, deduplicated."
         ),
     )
     ctime: datetime = Field(description="Creation time (ISO 8601, UTC).")
