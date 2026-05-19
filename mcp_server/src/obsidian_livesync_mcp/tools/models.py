@@ -221,9 +221,7 @@ class KeywordMatch(BaseModel):
 class KeywordSearchOutput(BaseModel):
     """Results of a keyword/regex search."""
 
-    matches: list[KeywordMatch] = Field(
-        description="Matches ranked by note path (lexicographic)."
-    )
+    matches: list[KeywordMatch] = Field(description="Matches ranked by note path (lexicographic).")
     total_matches: int = Field(
         ge=0,
         description="Total number of matches found (may exceed result count if truncated).",
@@ -237,9 +235,7 @@ class NoteReadError(BaseModel):
     """Error details when reading a note fails."""
 
     path: str = Field(description="The path that could not be read.")
-    error: str = Field(
-        description="Error message (e.g., 'not found', 'decryption failed')."
-    )
+    error: str = Field(description="Error message (e.g., 'not found', 'decryption failed').")
 
 
 class BatchReadOutput(BaseModel):
@@ -271,19 +267,14 @@ class ChangeItem(BaseModel):
     """A single change event in the vault."""
 
     path: str = Field(description="Path of the note affected.")
-    change_type: str = Field(
-        description='Type of change: "create", "update", or "delete".'
-    )
-    mtime: datetime = Field(
-        description="Timestamp of the change (ISO 8601, UTC)."
-    )
+    change_type: str = Field(description='Type of change: "create", "update", or "delete".')
+    mtime: datetime = Field(description="Timestamp of the change (ISO 8601, UTC).")
     deleted: bool = Field(
         description="True if the note is soft-deleted. Always False if type != delete."
     )
     seq: int = Field(
         description=(
-            "CouchDB sequence number. Use for resumable polling with "
-            "`since_seq` parameter."
+            "CouchDB sequence number. Use for resumable polling with `since_seq` parameter."
         ),
     )
     size_bytes: int | None = Field(
@@ -295,9 +286,7 @@ class ChangeItem(BaseModel):
 class RecentChangesOutput(BaseModel):
     """Results of querying recent vault changes."""
 
-    changes: list[ChangeItem] = Field(
-        description="Changes matching the query, most recent first."
-    )
+    changes: list[ChangeItem] = Field(description="Changes matching the query, most recent first.")
     watermark_seq: int = Field(
         description=(
             "Highest sequence number in the results. "

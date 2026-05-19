@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
-
-from ..errors import NoteNotFoundError
 
 
 @dataclass
@@ -123,7 +120,11 @@ def extract_wikilinks(content: str) -> list[tuple[str, str]]:
 
         # If there's a suffix (pipe or #), include it in raw_text
         if suffix:
-            raw_text = f"[[{target}|{suffix}]]" if "|" in f"[[{target}|{suffix}]]" else f"[[{target}#{suffix}]]"
+            raw_text = (
+                f"[[{target}|{suffix}]]"
+                if "|" in f"[[{target}|{suffix}]]"
+                else f"[[{target}#{suffix}]]"
+            )
         else:
             raw_text = f"[[{target}]]"
 

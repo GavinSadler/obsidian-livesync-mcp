@@ -72,7 +72,7 @@ def extract_frontmatter(content: str) -> tuple[dict[str, Any], str]:
         return {}, content
 
     yaml_text = content[3:end_marker]
-    remaining = content[end_marker + 5:]
+    remaining = content[end_marker + 5 :]
 
     try:
         frontmatter = yaml.safe_load(yaml_text) or {}

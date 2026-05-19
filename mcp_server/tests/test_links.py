@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from obsidian_livesync_mcp.livesync.links import (
     LinkGraph,
     extract_wikilinks,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
+from typing import Any
 
 from obsidian_livesync_mcp.livesync.models import extract_frontmatter, extract_tags
 
@@ -113,7 +113,7 @@ def test_extract_tags_mixed_list_and_string() -> None:
 
 
 def test_extract_tags_empty() -> None:
-    frontmatter = {}
+    frontmatter: dict[str, Any] = {}
     tags = extract_tags(frontmatter)
     assert tags == []
 
@@ -132,7 +132,7 @@ def test_extract_tags_deduplicate() -> None:
 
 def test_extract_tags_ignores_non_string_items() -> None:
     # List with non-string items should be skipped gracefully
-    frontmatter = {"tags": ["foo", 123, "bar"]}  # type: ignore
+    frontmatter: dict[str, Any] = {"tags": ["foo", 123, "bar"]}
     tags = extract_tags(frontmatter)
     assert "foo" in tags
     assert "bar" in tags

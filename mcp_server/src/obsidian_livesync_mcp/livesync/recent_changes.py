@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -74,7 +74,7 @@ class RecentChangesQuery:
                     "h": timedelta(hours=amount),
                     "d": timedelta(days=amount),
                 }[unit]
-                cutoff_time = datetime.now(timezone.utc) - delta
+                cutoff_time = datetime.now(UTC) - delta
                 return int(cutoff_time.timestamp() * 1000)
 
             # Try ISO 8601: "2026-05-19T00:00:00Z" or "2026-05-19"
@@ -115,12 +115,7 @@ class RecentChangesQuery:
                 continue
 
             doc = row.get("doc", {})
-            if doc.get("_deleted"):
-                deleted = True
-            elif doc.get("deleted"):
-                deleted = True
-            else:
-                deleted = False
+            deleted = bool(doc.get("_deleted") or doc.get("deleted"))
 
             # If include_deleted=False, skip deleted notes
             if deleted and not include_deleted:

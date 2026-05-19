@@ -20,6 +20,8 @@ from obsidian_livesync_mcp.errors import CouchDBError
 class FakeCouchDBClient:
     def __init__(self) -> None:
         self.docs: dict[str, dict[str, Any]] = {}
+        self._seq_counter = 0
+        self._changes_log: list[dict[str, Any]] = []
 
     async def close(self) -> None:  # pragma: no cover
         pass
@@ -45,6 +47,14 @@ class FakeCouchDBClient:
         stored = dict(doc)
         stored["_rev"] = new_rev
         self.docs[doc_id] = stored
+        self._seq_counter += 1
+        self._changes_log.append(
+            {
+                "seq": self._seq_counter,
+                "id": doc_id,
+                "doc": dict(stored),
+            }
+        )
         return {"ok": True, "id": doc_id, "rev": new_rev}
 
     async def bulk_get(self, doc_ids: list[str]) -> list[dict[str, Any] | None]:
@@ -91,6 +101,11 @@ class FakeCouchDBClient:
         feed: str = "continuous",
         include_docs: bool = True,
         heartbeat_ms: int = 30_000,
-    ) -> AsyncIterator[dict[str, Any]]:  # pragma: no cover
-        if False:
-            yield {}
+    ) -> AsyncIterator[dict[str, Any]]:
+        try:
+            since_seq = int(since) if since != "now" else self._seq_counter
+        except (ValueError, TypeError):
+            since_seq = 0
+        for row in self._changes_log:
+            if row["seq"] > since_seq:
+                yield dict(row)

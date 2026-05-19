@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
-import pytest
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from obsidian_livesync_mcp.livesync.recent_changes import (
     ChangeRecord,
@@ -46,8 +45,7 @@ def test_recent_changes_query_parse_since_int() -> None:
 def test_recent_changes_query_parse_since_relative_hours() -> None:
     query = RecentChangesQuery()
     result = query.parse_since_param("1h")
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    one_hour_ago = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
+    one_hour_ago = int((datetime.now(UTC) - timedelta(hours=1)).timestamp() * 1000)
     # Result should be close to one hour ago
     assert abs(result - one_hour_ago) < 60000  # Within 1 minute
 
@@ -55,18 +53,14 @@ def test_recent_changes_query_parse_since_relative_hours() -> None:
 def test_recent_changes_query_parse_since_relative_minutes() -> None:
     query = RecentChangesQuery()
     result = query.parse_since_param("30m")
-    thirty_min_ago = int(
-        (datetime.now(timezone.utc) - timedelta(minutes=30)).timestamp() * 1000
-    )
+    thirty_min_ago = int((datetime.now(UTC) - timedelta(minutes=30)).timestamp() * 1000)
     assert abs(result - thirty_min_ago) < 60000
 
 
 def test_recent_changes_query_parse_since_relative_days() -> None:
     query = RecentChangesQuery()
     result = query.parse_since_param("7d")
-    seven_days_ago = int(
-        (datetime.now(timezone.utc) - timedelta(days=7)).timestamp() * 1000
-    )
+    seven_days_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp() * 1000)
     assert abs(result - seven_days_ago) < 60000
 
 
@@ -161,7 +155,7 @@ def test_recent_changes_query_filter_change_types() -> None:
 
 def test_recent_changes_query_filter_missing_seq() -> None:
     query = RecentChangesQuery()
-    changes = [
+    changes: list[dict[str, Any]] = [
         {"doc": {"path": "a.md"}},  # Missing seq
         {"seq": 2, "doc": {"path": "b.md", "mtime": 2000, "size": 200}},
     ]
