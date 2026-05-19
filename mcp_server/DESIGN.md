@@ -85,38 +85,41 @@ where it materially affects results.
 
 ### MCP tools — notes (CRUD)
 
-- [ ] `list_notes(path_prefix?, limit?)` — list note paths in the vault.
+- [x] `list_notes(folder?, limit?)` — list note paths in the vault.
       Supports prefix filter for folder-style browsing.
-- [ ] `read_note(path)` — read full markdown content of a note. Handles
-      chunk reassembly, decompression, and decryption transparently.
-- [ ] `create_note(path, content)` — create a new note. Fails if the path
+- [x] `read_note(path)` — read full markdown content of a note. Handles
+      chunk reassembly + decompression. Encryption raises a clear error.
+- [x] `create_note(path, content)` — create a new note. Fails if the path
       already exists.
-- [ ] `update_note(path, content)` — overwrite the content of an existing
+- [x] `update_note(path, content)` — overwrite the content of an existing
       note. Handles chunking + metadata updates.
-- [ ] `delete_note(path)` — soft-delete a note (sets `deleted: true`).
-- [ ] `move_note(old_path, new_path)` — rename/move a note. Atomic from
-      the caller's perspective; may be read + create + delete under the
-      hood.
+- [x] `delete_note(path)` — soft-delete a note (sets `deleted: true`).
+- [x] `move_note(old_path, new_path)` — rename/move a note. Atomic from
+      the caller's perspective; create-then-delete under the hood.
 
 ### MCP tools — search
 
-- [ ] `semantic_search(query, top_k?)` — vector similarity search over
+- [~] `semantic_search(query, top_k?)` — vector similarity search over
       indexed note chunks. Response includes an `index_coverage:
       {indexed, total}` field so the caller can tell "no matches" from
       "index not yet built". No folder filter in v1.
+      **MVP: stub** — returns empty results with honest coverage stats
+      reflecting no index built. Full implementation needs vector store
+      + embedding backend + `_changes` subscriber.
 
 ### LiveSync schema support
 
-- [ ] CouchDB connection (basic auth + TLS).
-- [ ] Path → document ID encoding (plain mode).
-- [ ] Path → document ID encoding (obfuscated `f:` mode, SHA-256 stretched).
-- [ ] Chunk reassembly from `children[]` references.
-- [ ] Note write path: content splitting, chunk hashing (`h:` IDs), parent
-      doc with `children[]` and `eden` field.
-- [ ] Soft-delete via `deleted: true`.
-- [ ] Compression / decompression (fflate / deflate, `~` marker).
-- [ ] Encryption V2 (HKDF, `%=` marker) — read.
-- [ ] Encryption V2 (HKDF) — write.
+- [x] CouchDB connection (basic auth + TLS).
+- [x] Path → document ID encoding (plain mode).
+- [x] Path → document ID encoding (obfuscated `f:` mode, SHA-256 stretched).
+      *(Implemented; needs real-vault verification — see Known gaps.)*
+- [x] Chunk reassembly from `children[]` references.
+- [x] Note write path: content splitting, chunk hashing (`h:` IDs via
+      XXHash64 + base36), parent doc with `children[]` and empty `eden` field.
+- [x] Soft-delete via `deleted: true`.
+- [x] Compression / decompression (deflate via stdlib `zlib`, `~` marker).
+- [ ] Encryption V2 (HKDF, `%=` marker) — read. *(MVP: not supported.)*
+- [ ] Encryption V2 (HKDF) — write. *(MVP: not supported.)*
 - [ ] Encryption V1 (PBKDF2, `%` marker) — read. *(legacy, may skip)*
 
 ### Vector index
@@ -145,8 +148,9 @@ visible to the LLM. The only place its state leaks into the API is the
 - [x] uv-managed Python project.
 - [x] pytest + pytest-asyncio test scaffolding.
 - [x] ruff for lint + format.
-- [ ] mypy or pyright type-checking in CI.
-- [ ] GitHub Actions: lint, type-check, test on push/PR.
+- [x] mypy type-checking in CI.
+- [x] GitHub Actions: lint, format, type-check, test on push/PR
+      (path-filtered to `mcp_server/**`).
 - [ ] Docker image for running the server.
 
 ---

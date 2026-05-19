@@ -7,17 +7,25 @@ the [Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync) plugin.
 The server connects directly to CouchDB — no running Obsidian instance
 required.
 
-> **Status:** scaffolding only. See [DESIGN.md](./DESIGN.md) for the running
-> requirements list and current implementation status.
+> **Status:** MVP. All 7 MCP tools (`list_notes`, `read_note`, `create_note`,
+> `update_note`, `delete_note`, `move_note`, `semantic_search`) are wired up.
+> `semantic_search` is a stub (returns empty results with honest
+> `index_coverage`) until we pick a vector store / embedding backend.
+> **Encryption is NOT supported in this MVP** — the vault must have
+> "End-to-End Encryption" disabled in the LiveSync plugin settings. See
+> [DESIGN.md](./DESIGN.md) "Known gaps & compatibility risks" for the full
+> list of unresolved spec questions.
 
 ## Quick start
 
 ```bash
 # from this directory (mcp_server/):
-uv sync                  # install dependencies into .venv
-uv run pytest            # run tests
-uv run ruff check .      # lint
-uv run mypy src          # type-check
+uv sync                          # install dependencies into .venv
+uv run pytest                    # run tests
+uv run ruff format --check .     # check formatting
+uv run ruff check .              # lint
+uv run mypy src tests            # type-check
+uv run obsidian-livesync-mcp     # run the server (stdio transport)
 ```
 
 ## Configuration
