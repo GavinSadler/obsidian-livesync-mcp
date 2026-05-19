@@ -343,7 +343,80 @@ flowchart TD
 
 ### `create_note`
 
-*(API definition pending — to be filled in.)*
+Create a new note. Fails if a non-deleted note already exists at the path.
+A soft-deleted note at the path is silently overwritten (resurrected),
+matching the LiveSync plugin's own behavior.
+
+```python
+class CreateNoteInput(BaseModel):
+    """Create a new note. Fails if a live note already exists at the path."""
+
+    path: str = Field(
+        description=(
+            "Path where the new note will be created, relative to vault root. "
+            "Must end in '.md'. Must not already exist (a soft-deleted note "
+            "at the same path is fine — it will be transparently overwritten). "
+            "Parent folders are implicit; writing 'projects/new/notes.md' "
+            "works even if 'projects/new/' is otherwise empty. "
+            "Forward slashes only, case-sensitive."
+        ),
+    )
+    content: str = Field(
+        description=(
+            "Initial markdown content of the note. May be empty. "
+            "May include YAML frontmatter at the top. "
+            "Transparently chunked, compressed, and encrypted on write."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model. `ctime == mtime` (both set to now, UTC).
+
+**Errors:**
+- `NoteAlreadyExistsError` — a non-deleted note already exists at the path.
+  The LLM should use `update_note` (or `delete_note` then `create_note`)
+  to replace it intentionally.
+- `InvalidPathError` — empty, leading slash, contains `..`, doesn't end
+  in `.md`, or contains characters Obsidian rejects (`\`, `:`, `*`, `?`,
+  `"`, `<`, `>`, `|`).
+
+**Behavior with soft-deleted ghosts (matches LiveSync plugin):**
+- Reuse the existing doc's `_id` and chain off its `_rev`.
+- Clear the `deleted` flag by writing a new revision without it.
+- Discard the old chunk references; the plugin's
+  `purgeUnreferencedChunks` maintenance task will GC orphaned chunks.
+- Treat `ctime` as fresh — set to "now," not inherited from the tombstone.
+
+This is exactly what the plugin does (see
+`src/lib/src/managers/EntryManager/EntryManagerImpls.ts:197-220`), so our
+writes are indistinguishable from a LiveSync client's.
+
+```mermaid
+flowchart TD
+    A[create_note path, content] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path → doc ID]
+    C --> D[GET existing doc]
+    D --> E{exists?}
+    E -- no --> G[prepare new doc<br/>ctime=mtime=now]
+    E -- yes --> F{deleted: true?}
+    F -- no --> Y[NoteAlreadyExistsError]
+    F -- yes --> G2[prepare new doc<br/>reuse _id, chain off old _rev<br/>ctime=mtime=now, clear deleted]
+    G --> H
+    G2 --> H[split content into chunks]
+    H --> I{encryption enabled?}
+    I -- yes --> J[encrypt each chunk]
+    I -- no --> K
+    J --> K{compression enabled?}
+    K -- yes --> L[deflate each chunk]
+    K -- no --> M
+    L --> M[hash each chunk → 'h:' IDs]
+    M --> N[_bulk_docs: write chunks + parent doc]
+    N --> O{409 conflict?}
+    O -- yes, retries < 3 --> D
+    O -- yes, exhausted --> Z[NoteWriteError]
+    O -- no --> P[Return Note]
+```
 
 ### `update_note`
 
