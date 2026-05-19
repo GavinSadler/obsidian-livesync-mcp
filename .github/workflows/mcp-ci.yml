@@ -78,7 +78,7 @@ jobs:
         run: cd mcp_server && uv sync
 
       - name: Run tests
-        run: cd mcp_server && uv run pytest --cov=src --cov-report=term-only
+        run: cd mcp_server && uv run pytest --cov=src --cov-report=term
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
