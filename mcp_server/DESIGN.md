@@ -100,10 +100,10 @@ where it materially affects results.
 
 ### MCP tools — search
 
-- [ ] `semantic_search(query, top_k?, path_filter?)` — vector similarity
-      search over indexed note chunks. Response includes an
-      `index_coverage: {indexed, total}` field so the caller can tell
-      "no matches" from "index not yet built".
+- [ ] `semantic_search(query, top_k?)` — vector similarity search over
+      indexed note chunks. Response includes an `index_coverage:
+      {indexed, total}` field so the caller can tell "no matches" from
+      "index not yet built". No folder filter in v1.
 
 ### LiveSync schema support
 
@@ -652,7 +652,136 @@ change a doc's `_id`. It's create + delete with extra steps.
 
 ### `semantic_search`
 
-*(API definition pending — to be filled in.)*
+Vector similarity search over indexed note chunks. The index is maintained
+in the background by a `_changes` subscriber (see Vector index requirements);
+the LLM never triggers indexing directly. Folder filtering is intentionally
+omitted from the first cut — the LLM can call `list_notes` for scoped
+browsing, and `semantic_search` is meant for vault-wide semantic discovery.
+
+```python
+class SemanticSearchInput(BaseModel):
+    """Search the vault using semantic (vector) similarity."""
+
+    query: str = Field(
+        min_length=1,
+        max_length=2000,
+        description=(
+            "Search query: phrase, question, or keywords. "
+            "The query is embedded and matched against indexed note chunks. "
+            "Examples: 'project planning tips', 'how to set goals'."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum results to return. Defaults to 5; cap is 50. "
+            "One note may appear multiple times if it has multiple "
+            "matching sections (each is a separate chunk)."
+        ),
+    )
+
+
+class SearchHit(BaseModel):
+    """A single search result — a matched text chunk with context."""
+
+    path: str = Field(
+        description="Path of the note containing this match.",
+    )
+    heading: str | None = Field(
+        description=(
+            "Nearest markdown heading above the match "
+            "(e.g., '# Title' or '## Subsection'). "
+            "None if the match appears before any heading."
+        ),
+    )
+    snippet: str = Field(
+        description=(
+            "Matched text snippet (first ~200 characters of the chunk). "
+            "Exact boundaries depend on chunking and the vector store."
+        ),
+    )
+    score: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Similarity score, normalized to [0, 1]. 1.0 is highest "
+            "relevance. Exact interpretation depends on the embedding "
+            "model and distance metric."
+        ),
+    )
+    mtime: datetime = Field(
+        description="Last modification time of the note (ISO 8601, UTC).",
+    )
+    size_bytes: int = Field(
+        ge=0,
+        description="Plaintext size of the note in bytes (UTF-8).",
+    )
+
+
+class IndexCoverage(BaseModel):
+    """Coverage statistics of the semantic search index."""
+
+    indexed: int = Field(
+        ge=0,
+        description=(
+            "Number of notes currently indexed and searchable. "
+            "May be less than total if indexing is still in progress."
+        ),
+    )
+    total: int = Field(
+        ge=0,
+        description=(
+            "Total notes in the vault. If indexed < total, the index "
+            "is still being built and results may be incomplete."
+        ),
+    )
+
+
+class SemanticSearchOutput(BaseModel):
+    """Results of a semantic search query."""
+
+    results: list[SearchHit] = Field(
+        description=(
+            "Matched chunks ranked by score (highest first). "
+            "May be fewer than top_k. Empty if nothing matched, or if "
+            "the index is not yet built — check index_coverage to tell "
+            "those cases apart."
+        ),
+    )
+    index_coverage: IndexCoverage = Field(
+        description=(
+            "Index status. If indexed < total, the index is still "
+            "building; some notes may not yet be searchable."
+        ),
+    )
+```
+
+**Errors:** none under normal operation. Empty `results` with honest
+`index_coverage` covers both "no matches" and "index not ready."
+
+**Behavior:**
+- The vector index is updated continuously by a background subscriber to
+  the CouchDB `_changes` feed. The LLM does not (and cannot) trigger
+  indexing through MCP.
+- Returns up to `top_k` chunks. Multiple chunks from the same note are
+  allowed and not deduplicated — each represents a distinct semantic match.
+- `heading` is best-effort: derived from the chunk's position within the
+  reassembled note. None is returned if the chunk precedes any heading.
+- `mtime` and `size_bytes` are read from the parent note doc at query
+  time (or cached alongside the vector); they reflect the note's current
+  state, not the state at index time.
+
+```mermaid
+flowchart TD
+    A[semantic_search query, top_k] --> B[embed query with configured backend]
+    B --> C[vector store: nearest top_k chunk vectors]
+    C --> D[for each hit: load parent note metadata]
+    D --> E[derive nearest heading for each chunk]
+    E --> F[count total notes and indexed notes]
+    F --> G[Return results + index_coverage]
+```
 
 ---
 
@@ -723,9 +852,6 @@ change a doc's `_id`. It's create + delete with extra steps.
   the official LiveSync plugin without trouble. This means matching their
   `eden` field semantics and chunk hashing exactly. To be verified with
   round-trip tests against a real vault.
-- **Search-while-indexing.** What does `semantic_search` return if the
-  index is incomplete? Probably: include a `coverage` field in the
-  response so the LLM knows.
 
 ## Reference
 
