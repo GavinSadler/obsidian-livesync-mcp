@@ -13,6 +13,7 @@ dependencies = [
     "cryptography>=42.0.0",
     "anyio>=4.4.0",
     "xxhash>=3.4.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

@@ -7,6 +7,7 @@ field descriptions are normative.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -22,8 +23,23 @@ class NoteModel(BaseModel):
     content: str = Field(
         description=(
             "Full markdown content as UTF-8 text. "
-            "Includes any YAML frontmatter at the top, verbatim. "
-            "Whitespace and line endings preserved as stored."
+            "Frontmatter (if present) has been stripped into the `frontmatter` field. "
+            "Whitespace and line endings in the body are preserved as stored."
+        ),
+    )
+    frontmatter: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Parsed YAML frontmatter from the top of the note. "
+            "None if the note has no frontmatter or if parsing failed. "
+            "Commonly includes metadata like tags, keywords, created, etc."
+        ),
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tags extracted from frontmatter (tags or keywords fields). "
+            "None if no tags found. Lowercase, deduplicated."
         ),
     )
     ctime: datetime = Field(description="Creation time (ISO 8601, UTC).")
@@ -34,14 +50,27 @@ class NoteModel(BaseModel):
     )
 
     @classmethod
-    def from_repo_note(cls, note: object) -> NoteModel:
+    def from_repo_note(cls, note: object, include_frontmatter: bool = True) -> NoteModel:
         # Imported lazily to avoid a top-level circular import.
+        from ..livesync.models import extract_frontmatter, extract_tags
         from ..livesync.notes import Note
 
         assert isinstance(note, Note)
+
+        frontmatter = None
+        tags = None
+        content = note.content
+
+        if include_frontmatter:
+            frontmatter, content = extract_frontmatter(note.content)
+            if frontmatter:
+                tags = extract_tags(frontmatter)
+
         return cls(
             path=note.path,
-            content=note.content,
+            content=content,
+            frontmatter=frontmatter or None,
+            tags=tags or None,
             ctime=_ms_to_iso(note.ctime),
             mtime=_ms_to_iso(note.mtime),
             size_bytes=note.size,
@@ -150,4 +179,141 @@ class SemanticSearchOutput(BaseModel):
     )
     index_coverage: IndexCoverage = Field(
         description=("Index status. If indexed < total, the index is still building."),
+    )
+
+
+# --- Links & Backlinks ---
+
+
+class LinkSearchOutput(BaseModel):
+    """Result of a forward-links or backlinks query."""
+
+    path: str = Field(description="The note path queried (echoed from input).")
+    forward_links: list[str] = Field(
+        default_factory=list,
+        description="Paths of notes referenced by this note (outgoing [[links]]).",
+    )
+    backlinks: list[str] = Field(
+        default_factory=list,
+        description="Paths of notes that reference this note (incoming [[links]]).",
+    )
+
+
+# --- Keyword Search ---
+
+
+class KeywordMatch(BaseModel):
+    """A single match in keyword search results."""
+
+    path: str = Field(description="Path of the note containing the match.")
+    line_number: int = Field(
+        ge=1,
+        description="Line number in the note where the match occurs (1-indexed).",
+    )
+    snippet: str = Field(
+        description=(
+            "The matched line or excerpt around the match. "
+            "Limited to ~200 characters for readability."
+        ),
+    )
+
+
+class KeywordSearchOutput(BaseModel):
+    """Results of a keyword/regex search."""
+
+    matches: list[KeywordMatch] = Field(
+        description="Matches ranked by note path (lexicographic)."
+    )
+    total_matches: int = Field(
+        ge=0,
+        description="Total number of matches found (may exceed result count if truncated).",
+    )
+
+
+# --- Batch Operations ---
+
+
+class NoteReadError(BaseModel):
+    """Error details when reading a note fails."""
+
+    path: str = Field(description="The path that could not be read.")
+    error: str = Field(
+        description="Error message (e.g., 'not found', 'decryption failed')."
+    )
+
+
+class BatchReadOutput(BaseModel):
+    """Results of reading multiple notes at once."""
+
+    notes: dict[str, NoteModel | NoteReadError] = Field(
+        description=(
+            "Results keyed by path. Value is either a NoteModel (success) "
+            "or NoteReadError (failure)."
+        ),
+    )
+    succeeded: int = Field(ge=0, description="Number of notes successfully read.")
+    failed: int = Field(ge=0, description="Number of notes that failed to read.")
+
+
+class AppendNoteOutput(NoteModel):
+    """Result of appending to a note."""
+
+    appended_bytes: int = Field(
+        ge=0,
+        description="Number of bytes appended (including the separator newline).",
+    )
+
+
+# --- Recent Changes ---
+
+
+class ChangeItem(BaseModel):
+    """A single change event in the vault."""
+
+    path: str = Field(description="Path of the note affected.")
+    change_type: str = Field(
+        description='Type of change: "create", "update", or "delete".'
+    )
+    mtime: datetime = Field(
+        description="Timestamp of the change (ISO 8601, UTC)."
+    )
+    deleted: bool = Field(
+        description="True if the note is soft-deleted. Always False if type != delete."
+    )
+    seq: int = Field(
+        description=(
+            "CouchDB sequence number. Use for resumable polling with "
+            "`since_seq` parameter."
+        ),
+    )
+    size_bytes: int | None = Field(
+        default=None,
+        description="Size of the note in bytes (None if deleted).",
+    )
+
+
+class RecentChangesOutput(BaseModel):
+    """Results of querying recent vault changes."""
+
+    changes: list[ChangeItem] = Field(
+        description="Changes matching the query, most recent first."
+    )
+    watermark_seq: int = Field(
+        description=(
+            "Highest sequence number in the results. "
+            "Pass as `since_seq` on the next poll for incremental updates."
+        ),
+    )
+    total_available: int = Field(
+        ge=0,
+        description=(
+            "Total changes matching the filter (not including watermark changes). "
+            "If total_available > len(changes), results were truncated."
+        ),
+    )
+    truncated: bool = Field(
+        description=(
+            "True if more results are available beyond the limit. "
+            "Use `since_seq` to fetch the next batch."
+        ),
     )
