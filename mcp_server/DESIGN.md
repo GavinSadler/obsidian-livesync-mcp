@@ -118,9 +118,18 @@ where it materially affects results.
       XXHash64 + base36), parent doc with `children[]` and empty `eden` field.
 - [x] Soft-delete via `deleted: true`.
 - [x] Compression / decompression (deflate via stdlib `zlib`, `~` marker).
-- [ ] Encryption V2 (HKDF, `%=` marker) — read. *(MVP: not supported.)*
-- [ ] Encryption V2 (HKDF) — write. *(MVP: not supported.)*
-- [ ] Encryption V1 (PBKDF2, `%` marker) — read. *(legacy, may skip)*
+- [x] Encryption V2 (HKDF, `%=` marker) — read & write. Implemented via
+      the `cryptography` library; PBKDF2 (310k iter, SHA-256) → HKDF
+      (SHA-256, empty info) → AES-GCM-256, with `iv[12] || hkdf_salt[32]
+      || ct+tag` wire layout. Spec mirrored from
+      `octagonal-wheels/src/encryption/hkdf.ts`. Vault PBKDF2 salt is
+      fetched at startup from `_local/obsidian_livesync_sync_parameters`.
+- [x] Encryption V2 (HKDF) ephemeral-salt `%$` — read only (used by
+      session-scoped payloads).
+- [ ] Encryption V1 (PBKDF2, `%` marker) — *(legacy; not implemented,
+      raises a clear error)*.
+- [ ] Encryption V3 (`%~` marker, SHA-256-only KDF) — *(rare; not
+      implemented, raises a clear error)*.
 
 ### Vector index
 
@@ -847,15 +856,14 @@ can claim full round-trip compatibility with the LiveSync plugin.
 
 ### Hard limitations of the MVP
 
-- **No encryption support.** V2 (HKDF, `%=`) and V1 (PBKDF2, `%`) are both
-  unimplemented. The exact key derivation, IV handling, AES mode, and wire
-  format live in the JavaScript-only `octagonal-wheels` library, which has
-  no Python port. **The vault must have "End-to-End Encryption" disabled**
-  in the LiveSync plugin settings for the MCP server to work. Reads of
-  encrypted chunks will fail with a clear error; writes from the MCP server
-  will be unencrypted (which would mix with encrypted data and corrupt the
-  vault — so the server refuses to start if a passphrase is configured for
-  a vault that appears encrypted).
+- **Encryption: V2 HKDF only.** The current LiveSync format (`%=`) is
+  implemented end-to-end via the `cryptography` library, with spec
+  mirrored from `octagonal-wheels/src/encryption/hkdf.ts`. Ephemeral
+  salt (`%$`) is decoded for reads. Legacy `%` (PBKDF2) and `%~` (V3)
+  chunks raise `EncryptionNotSupportedError`. The implementation is
+  spec-correct under unit testing but **has not been validated against
+  a real plugin-encrypted vault yet** — that interop round-trip is the
+  next outstanding compatibility task.
 
 ### Unresolved spec questions (need real-vault verification)
 
@@ -872,11 +880,13 @@ can claim full round-trip compatibility with the LiveSync plugin.
   paths — is not obvious. Our writes should match whichever marker the
   plugin currently produces for new chunks. Verify with a real vault.
 
-- **HKDF parameters.** If we ever add encryption support: the exact info
-  string, output length, AES mode (GCM vs CBC), IV derivation, and
-  ciphertext+tag concatenation order are all hidden inside
-  `octagonal-wheels`. Either trace through that library or do
-  interop round-trip tests; don't guess.
+- **HKDF parameters — implemented but unverified against a real vault.**
+  Parameters traced from `octagonal-wheels/src/encryption/hkdf.ts`:
+  PBKDF2-HMAC-SHA256 (310 000 iter, 32-byte salt), HKDF-SHA256 with empty
+  `info` and 32-byte salt, AES-GCM-256 with 12-byte IV and appended
+  16-byte tag, layout `iv[12] || hkdf_salt[32] || ct+tag`. Round-trips
+  in unit tests, but cross-implementation interop (Python ↔ plugin)
+  still wants a live test.
 
 - **Hash algorithm selection.** The plugin supports XXHash64 (default),
   SHA1, and a pure-JS mixed hash. We implement XXHash64 only. If a user

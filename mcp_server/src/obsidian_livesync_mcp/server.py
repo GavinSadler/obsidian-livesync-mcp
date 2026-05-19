@@ -13,7 +13,7 @@ from pydantic import Field
 
 from .config import Settings, load_settings
 from .couchdb import CouchDBClient
-from .livesync.notes import NoteRepository
+from .livesync.notes import NoteRepository, fetch_pbkdf2_salt
 from .tools.models import (
     DeleteNoteOutput,
     ListNotesOutput,
@@ -159,16 +159,28 @@ def build_server(settings: Settings) -> FastMCP:
     ) -> SemanticSearchOutput:
         return await search_tools.semantic_search(query=query, top_k=top_k)
 
-    # Stash the CouchDB client on the server so we can close it on shutdown.
+    # Stash the CouchDB client and repo so _serve can finish async setup
+    # (salt fetch) and close the client on shutdown.
     mcp._couch_client_for_shutdown = couch  # type: ignore[attr-defined]
+    mcp._repo_for_async_setup = repo  # type: ignore[attr-defined]
     return mcp
 
 
 async def _serve(mcp: FastMCP) -> None:
+    couch = getattr(mcp, "_couch_client_for_shutdown", None)
+    repo: NoteRepository | None = getattr(mcp, "_repo_for_async_setup", None)
     try:
+        # When a passphrase is configured, fetch the vault's PBKDF2 salt
+        # from CouchDB before serving any requests. If the salt isn't
+        # available yet, encrypted reads/writes will fail loudly later;
+        # we don't block startup since the user may want to inspect a
+        # vault that hasn't yet been initialised on the plugin side.
+        if repo is not None and couch is not None and repo.needs_encryption:
+            salt = await fetch_pbkdf2_salt(couch)
+            if salt is not None:
+                repo.set_pbkdf2_salt(salt)
         await mcp.run_stdio_async()
     finally:
-        couch = getattr(mcp, "_couch_client_for_shutdown", None)
         if couch is not None:
             await couch.close()
 

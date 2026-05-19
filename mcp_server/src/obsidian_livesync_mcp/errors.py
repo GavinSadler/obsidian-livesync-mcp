@@ -54,4 +54,10 @@ class CouchDBError(LiveSyncMCPError):
 
 
 class EncryptedVaultError(LiveSyncMCPError):
-    """The vault appears to be encrypted; the MVP doesn't support that."""
+    """Encrypted chunk encountered but the server can't decrypt it.
+
+    Raised when a chunk is encrypted in an unsupported format (legacy
+    ``%`` or ``%~``), or when no passphrase / PBKDF2 salt has been
+    configured. Configure ``LIVESYNC_PASSPHRASE`` and ensure the vault's
+    sync-parameters doc is reachable.
+    """

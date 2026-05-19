@@ -6,6 +6,7 @@ and the inverse for writes.
 
 from __future__ import annotations
 
+import base64
 import re
 import time
 from dataclasses import dataclass
@@ -27,6 +28,27 @@ from .paths import path_to_id
 
 WRITE_RETRY_LIMIT = 3
 MAX_READ_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB safety net
+
+SYNC_PARAMETERS_DOC_ID = "_local/obsidian_livesync_sync_parameters"
+
+
+async def fetch_pbkdf2_salt(couch: CouchDBClient) -> bytes | None:
+    """Read the vault's PBKDF2 salt from CouchDB.
+
+    The LiveSync plugin stores it in a local doc at
+    ``_local/obsidian_livesync_sync_parameters``, in the ``pbkdf2salt``
+    field, base64-encoded. Returns ``None`` if the doc or field is
+    missing (the vault has never been opened with E2EE enabled on the
+    plugin side).
+    """
+    doc = await couch.get(SYNC_PARAMETERS_DOC_ID)
+    if doc is None:
+        return None
+    encoded = doc.get("pbkdf2salt")
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    return base64.b64decode(encoded)
+
 
 # Forbid characters Obsidian itself rejects (Windows-incompatible).
 _FORBIDDEN_CHARS = re.compile(r'[\\:\*\?"<>|]')
@@ -58,12 +80,34 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _decode_chunk_payload(payload: str) -> str:
-    """Decompress + decrypt a chunk's `data` field into plaintext."""
-    if encryption.is_encrypted(payload):
+def _decode_chunk_payload(
+    payload: str, *, passphrase: str | None, pbkdf2_salt: bytes | None
+) -> str:
+    """Decrypt (if needed) then decompress a chunk's ``data`` field.
+
+    Order matters: the plugin compresses *before* encrypting, so on read
+    we decrypt first and then decompress the resulting cleartext.
+    """
+    if encryption.is_hkdf_encrypted(payload):
+        if not passphrase:
+            raise EncryptedVaultError(
+                "chunk is HKDF-encrypted but no LIVESYNC_PASSPHRASE is configured"
+            )
+        if payload.startswith(encryption.HKDF_PREFIX):
+            if pbkdf2_salt is None:
+                raise EncryptedVaultError(
+                    "chunk is HKDF-encrypted but the vault PBKDF2 salt is not loaded; "
+                    "check that the sync-parameters doc is reachable"
+                )
+            payload = encryption.decrypt_hkdf(payload, passphrase, pbkdf2_salt)
+        else:
+            # %$ ephemeral-salt format — salt travels with the ciphertext
+            payload = encryption.decrypt_ephemeral_hkdf(payload, passphrase)
+    elif encryption.is_encrypted(payload):
+        # Legacy V2 (%) or V3 (%~) — not implemented
         raise EncryptedVaultError(
-            "vault contains encrypted chunks; the MVP does not support encryption. "
-            "Disable End-to-End Encryption in the LiveSync plugin settings."
+            "chunk uses an unsupported legacy encryption format "
+            "(only HKDF / %= and %$ are implemented)"
         )
     if encryption.is_compressed(payload):
         return encryption.decompress(payload)
@@ -78,16 +122,31 @@ class NoteRepository:
         couch: CouchDBClient,
         *,
         passphrase: str | None = None,
+        pbkdf2_salt: bytes | None = None,
         obfuscate_paths: bool = False,
     ) -> None:
         self._couch = couch
         self._passphrase = passphrase
+        self._pbkdf2_salt = pbkdf2_salt
         self._obfuscate = obfuscate_paths
         if obfuscate_paths and not passphrase:
             raise ValueError("obfuscated paths require a passphrase")
+        if passphrase and pbkdf2_salt is None:
+            # Allowed for read-only/test cases, but we'll fail loud the
+            # first time we try to write an encrypted chunk.
+            pass
 
     def _path_to_id(self, path: str) -> str:
         return path_to_id(path, obfuscate=self._obfuscate, passphrase=self._passphrase)
+
+    def set_pbkdf2_salt(self, salt: bytes) -> None:
+        """Inject the vault PBKDF2 salt fetched at startup."""
+        self._pbkdf2_salt = salt
+
+    @property
+    def needs_encryption(self) -> bool:
+        """True iff a passphrase is configured (server should fetch the salt)."""
+        return bool(self._passphrase)
 
     async def list_paths(
         self,
@@ -171,7 +230,9 @@ class NoteRepository:
             data = chunk.get("data", "")
             if not isinstance(data, str):
                 raise NoteWriteError(f"chunk {cid!r} has non-string data field")
-            decoded = _decode_chunk_payload(data)
+            decoded = _decode_chunk_payload(
+                data, passphrase=self._passphrase, pbkdf2_salt=self._pbkdf2_salt
+            )
             total += len(decoded.encode("utf-8"))
             if total > MAX_READ_SIZE_BYTES:
                 raise NoteWriteError(
@@ -195,16 +256,28 @@ class NoteRepository:
         )
 
     def _build_chunk_docs(self, content: str) -> tuple[list[str], list[dict[str, Any]]]:
-        """Split + hash content. Returns (children_ids, chunk_docs_to_write)."""
+        """Split + hash + (optionally) compress + encrypt. Returns (children_ids, chunk_docs)."""
+        encrypting = bool(self._passphrase)
+        if encrypting and self._pbkdf2_salt is None:
+            raise EncryptedVaultError(
+                "LIVESYNC_PASSPHRASE is set but the vault PBKDF2 salt is not loaded; "
+                "cannot write encrypted chunks"
+            )
         pieces = split_content(content)
         children: list[str] = []
         docs: list[dict[str, Any]] = []
         seen: set[str] = set()
         for piece in pieces:
-            # Compress chunks above a small threshold; tiny chunks aren't
-            # worth the marker overhead.
             payload = encryption.compress(piece) if len(piece) > 64 else piece
-            chunk_id = hash_chunk(piece)
+            if encrypting:
+                # Cast satisfies mypy; the None case is guarded above.
+                assert self._pbkdf2_salt is not None
+                payload = encryption.encrypt_hkdf(
+                    payload, self._passphrase or "", self._pbkdf2_salt
+                )
+                chunk_id = hash_chunk(piece, encrypted=True)
+            else:
+                chunk_id = hash_chunk(piece)
             children.append(chunk_id)
             if chunk_id in seen:
                 continue

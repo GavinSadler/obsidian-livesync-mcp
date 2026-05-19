@@ -147,3 +147,47 @@ async def test_round_trip_large_content(repo: NoteRepository) -> None:
     read = await repo.read("big.md")
     assert read is not None
     assert read.content == body
+
+
+async def test_round_trip_with_hkdf_encryption() -> None:
+    """End-to-end: write encrypted, read back, recover original plaintext.
+
+    Exercises the full pipeline — splitter → compress → HKDF-encrypt →
+    CouchDB → decrypt → decompress → assemble. The fake CouchDB stores
+    whatever bytes the repo writes, so a successful round-trip implies
+    the on-wire data really was encrypted.
+    """
+    fake = FakeCouchDBClient()
+    pbkdf2_salt = b"\x01" * 32
+    repo = NoteRepository(
+        cast(CouchDBClient, fake),
+        passphrase="test-passphrase",
+        pbkdf2_salt=pbkdf2_salt,
+    )
+    plaintext = "secret note: 國破山河在 🍔\n" * 30
+    await repo.create("vault/secret.md", plaintext)
+
+    # Sanity: the underlying chunk docs are not stored as plaintext.
+    chunk_docs = [doc for doc_id, doc in fake.docs.items() if doc_id.startswith("h:")]
+    assert chunk_docs, "expected at least one chunk doc"
+    for doc in chunk_docs:
+        data = doc.get("data", "")
+        assert data.startswith("%="), f"chunk should be HKDF-encrypted, got: {data[:8]!r}"
+        assert "secret note" not in data
+
+    read = await repo.read("vault/secret.md")
+    assert read is not None
+    assert read.content == plaintext
+
+
+async def test_passphrase_without_salt_blocks_writes() -> None:
+    fake = FakeCouchDBClient()
+    repo = NoteRepository(
+        cast(CouchDBClient, fake),
+        passphrase="test-passphrase",
+        pbkdf2_salt=None,
+    )
+    from obsidian_livesync_mcp.errors import EncryptedVaultError
+
+    with pytest.raises(EncryptedVaultError):
+        await repo.create("blocked.md", "anything")

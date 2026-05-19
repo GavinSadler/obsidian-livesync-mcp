@@ -11,10 +11,12 @@ required.
 > `update_note`, `delete_note`, `move_note`, `semantic_search`) are wired up.
 > `semantic_search` is a stub (returns empty results with honest
 > `index_coverage`) until we pick a vector store / embedding backend.
-> **Encryption is NOT supported in this MVP** — the vault must have
-> "End-to-End Encryption" disabled in the LiveSync plugin settings. See
-> [DESIGN.md](./DESIGN.md) "Known gaps & compatibility risks" for the full
-> list of unresolved spec questions.
+> **Encryption:** HKDF / `%=` (the current LiveSync E2EE format) is
+> supported — set `LIVESYNC_PASSPHRASE`. The vault's PBKDF2 salt is
+> fetched from CouchDB at startup. Legacy `%` (PBKDF2) and `%~` (V3)
+> formats are not implemented. See
+> [DESIGN.md](./DESIGN.md) "Known gaps & compatibility risks" for the
+> remaining unresolved spec questions.
 
 ## Quick start
 

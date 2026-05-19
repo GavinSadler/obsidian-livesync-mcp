@@ -15,18 +15,24 @@ This is a snapshot of progress on the MVP MCP server, written so you
   + Mermaid diagrams; updated to mark implemented items `[x]`. Includes
   a "Known gaps & compatibility risks" section tracking things to
   resolve before claiming plugin-compatibility.
-- **README.md**: quick-start updated; flags encryption-not-supported.
+- **README.md**: quick-start updated; HKDF encryption (`%=`) supported
+  when `LIVESYNC_PASSPHRASE` is set.
 
 ### MVP implementation (in `mcp_server/src/obsidian_livesync_mcp/`)
 - `livesync/paths.py` — plain mode + obfuscated (`f:`) mode with
   SHA-256 stretching. *Obfuscated mode needs real-vault verification.*
 - `livesync/chunks.py` — line-aware splitter (max 1000 chars/chunk),
   XXHash64 chunk IDs in base36 (matches plugin default config).
-- `livesync/encryption.py` — deflate compression (`~` marker) using
-  stdlib `zlib`. Encryption functions raise `EncryptionNotSupportedError`.
+- `livesync/encryption.py` — deflate compression (`~` marker) and HKDF
+  V2 encryption (`%=` marker) implemented via the `cryptography`
+  library. Read support for `%$` ephemeral-salt HKDF too. Legacy `%`
+  (PBKDF2) and `%~` (V3) still raise `EncryptionNotSupportedError`.
 - `livesync/notes.py` — `NoteRepository` with full CRUD: read-modify-write
   with 409 retry (limit 3), soft-delete via `deleted: true`, `move` as
   create-then-delete with `MovePartialFailureError` if delete fails.
+  Encrypts/decrypts chunks transparently when `passphrase` +
+  `pbkdf2_salt` are set. `fetch_pbkdf2_salt(couch)` helper reads the
+  vault salt from `_local/obsidian_livesync_sync_parameters`.
 - `couchdb.py` — async httpx-based client (`get`, `put`, `bulk_get`,
   `bulk_docs`, `all_docs`, `changes` stream).
 - `errors.py` — typed exception hierarchy.
@@ -39,19 +45,22 @@ This is a snapshot of progress on the MVP MCP server, written so you
   `obsidian-livesync-mcp` console script is wired up.
 - `config.py` — `load_settings()` reads from env / `.env`.
 
-### Tests (50 total, all passing)
+### Tests (71 total, all passing)
 - `tests/fake_couch.py` — in-memory `CouchDBClient` stand-in with
   realistic MVCC semantics (rev tracking, 409 on stale writes).
 - `test_paths.py` (11) — plain & obfuscated round-trips, leading-`_`
   guard, fallback-path requirement, determinism, passphrase variance.
 - `test_chunks.py` (9) — split/assemble round-trip, max-size enforcement,
   hard-split for long lines, hash stability + prefix.
-- `test_encryption.py` (5) — marker detection, encryption stubs raise,
-  compress/decompress round-trip including unicode.
-- `test_notes_repository.py` (15) — full CRUD against fake CouchDB:
-  create, duplicate, invalid paths, read missing, update preserves
-  ctime, delete makes unreadable, resurrection, move, list filtering,
-  multi-chunk round-trip.
+- `test_encryption.py` (24) — wire-format constants pinned; marker
+  detection; PBKDF2 / HKDF derivation correctness + determinism; HKDF
+  encrypt/decrypt round-trips (ASCII, unicode, empty); layout sanity;
+  wrong-passphrase / wrong-salt rejection; dispatcher routing; legacy
+  formats raise `EncryptionNotSupportedError`; compress/decompress
+  round-trip including unicode.
+- `test_notes_repository.py` (17) — full CRUD against fake CouchDB plus
+  end-to-end HKDF round-trip (asserts chunk data on disk is genuinely
+  encrypted) and a "passphrase without salt blocks writes" guard.
 - `test_tools.py` (8) — MCP adapter layer: Pydantic conversion, ISO
   timestamps, folder normalization, semantic_search empty + honest
   coverage.
@@ -72,19 +81,23 @@ This is a snapshot of progress on the MVP MCP server, written so you
   - Persistent watermark of the last-seen sequence so we resume cleanly.
 
 ### Medium-priority
-- **Encryption support.** Requires tracing through the
-  `octagonal-wheels` JS library to get exact HKDF parameters, AES mode,
-  IV handling, and ciphertext+tag concatenation order. Right path is
-  probably an interop round-trip test against a real vault rather than
-  trying to derive the spec from JS.
+- **Encryption interop validation.** HKDF V2 (`%=`) is implemented and
+  unit-tested, but we still need a real round-trip against a vault
+  encrypted by the plugin: write from Python → read in Obsidian, and
+  vice versa. The spec is mirrored from
+  `/tmp/octagonal-wheels/src/encryption/hkdf.ts`; risk is parameter
+  drift, not the crypto itself.
 - **Docker image.** A Dockerfile + GHA release workflow.
 - **Splitter parity.** Our line-aware splitter doesn't match
-  `ContentSplitterV2`'s output. Content round-trips fine, but chunks
-  won't dedup with plugin-written notes. Port `splitPieces2V2` faithfully.
+  `ContentSplitterV2`'s output (lives in `livesync-commonlib` —
+  `src/lib/src/string_and_binary/chunks.ts`). Content round-trips fine,
+  but chunks won't dedup with plugin-written notes. Port
+  `splitPieces2V2` faithfully.
 
 ### Lower-priority
-- **V1 encryption (PBKDF2).** Legacy; probably skip unless someone
-  files an issue.
+- **Legacy "%" (PBKDF2) and "%~" (V3) encryption read support.**
+  Currently raise `EncryptionNotSupportedError`. Skip unless someone
+  files an issue with an older vault.
 - **Local read cache** (DESIGN.md "Deferred / backburner").
 
 ## Open design questions still on the table
