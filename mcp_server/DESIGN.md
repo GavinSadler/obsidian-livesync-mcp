@@ -77,11 +77,12 @@ resolution.
 This is the running source of truth for what the server should do. Items
 are tagged with status: `[ ]` planned, `[~]` in progress, `[x]` complete.
 
-The MCP surface is intentionally small — **7 tools total**. Every tool
-description occupies LLM context, and tighter tool sets produce better
-tool-selection behavior. Internal state (indexing progress, encryption,
-chunking, etc.) is deliberately hidden from the LLM; it shows up only
-where it materially affects results.
+The MCP surface is **14 tools total** — 8 CRUD/content operations, 5
+search & navigation tools, and 1 history query. Every tool description
+occupies LLM context, so each tool earns its slot by doing something
+materially different. Internal state (indexing progress, encryption,
+chunking, the link graph subscriber, etc.) is deliberately hidden from
+the LLM; it shows up only where it affects results.
 
 ### MCP tools — notes (CRUD)
 
@@ -837,6 +838,365 @@ flowchart TD
     E --> F[count total notes and indexed notes]
     F --> G[Return results + index_coverage]
 ```
+
+### `read_notes`
+
+Batch variant of `read_note`. Each path is attempted independently; a
+missing or unreadable note does **not** fail the whole call — it's
+reported per-path in the result. Useful when the LLM has a known set
+of paths (e.g. from `get_backlinks` or a folder listing) and wants
+their content in one round trip.
+
+```python
+class ReadNotesInput(BaseModel):
+    """Read multiple notes in one call. Per-path errors don't fail the batch."""
+
+    paths: list[str] = Field(
+        description=(
+            "Paths of notes to read, relative to vault root. "
+            "Paths are case-sensitive and use forward slashes. "
+            "An empty list returns an empty result."
+        ),
+    )
+
+
+class NoteReadError(BaseModel):
+    """Error details when reading a single note in a batch fails."""
+
+    path: str = Field(description="The path that could not be read.")
+    error: str = Field(
+        description="Error message (e.g. 'not found', 'decryption failed').",
+    )
+
+
+class BatchReadOutput(BaseModel):
+    """Results of reading multiple notes at once."""
+
+    notes: dict[str, NoteModel | NoteReadError] = Field(
+        description=(
+            "Results keyed by path. Value is either a Note (success) or "
+            "a NoteReadError (failure). Every requested path appears."
+        ),
+    )
+    succeeded: int = Field(ge=0, description="Number of notes successfully read.")
+    failed: int = Field(ge=0, description="Number of notes that failed to read.")
+```
+
+**Errors:** none at the batch level — individual failures are captured
+in `notes[path]` as `NoteReadError`.
+
+### `append_note`
+
+Append content to the end of an existing note. Safer than
+`read_note` + `update_note` for incremental writes (e.g. journal /
+log notes): the read-modify-write happens server-side in one call,
+so the LLM can't accidentally clobber concurrent changes by writing
+back stale content.
+
+```python
+class AppendNoteInput(BaseModel):
+    """Append content to the end of an existing note."""
+
+    path: str = Field(description="Path of the note to append to.")
+    content: str = Field(description="Content to append.")
+    separator: str = Field(
+        default="\n",
+        description=(
+            "String inserted between existing content and the appended content. "
+            "Default is a single newline; use '\\n\\n' for a blank-line gap."
+        ),
+    )
+
+
+class AppendNoteOutput(NoteModel):
+    """Result of an append: the full updated note plus how many bytes were added."""
+
+    appended_bytes: int = Field(
+        ge=0,
+        description=(
+            "Number of bytes appended (separator + content, UTF-8 encoded). "
+            "Useful for confirming the write took effect."
+        ),
+    )
+```
+
+**Errors:**
+- `NoteNotFoundError` — note doesn't exist. Use `create_note` instead.
+- `InvalidPathError` — path is malformed.
+
+### `keyword_search`
+
+Literal-string or regex search over note content, returning matched
+lines with line numbers and snippets. Complements `semantic_search`:
+keyword for "find exact text I remember writing", semantic for "find
+notes about a topic". Iterates over live notes, decrypting on the fly.
+
+```python
+class KeywordSearchInput(BaseModel):
+    """Search note content for a literal string or regex pattern."""
+
+    pattern: str = Field(
+        min_length=1,
+        description=(
+            "Search term. If regex=False, treated as a literal string "
+            "(special regex characters are escaped). If regex=True, "
+            "treated as a regular expression."
+        ),
+    )
+    case_sensitive: bool = Field(
+        default=False,
+        description="If True, match exact case. Default is case-insensitive.",
+    )
+    regex: bool = Field(
+        default=False,
+        description=(
+            "If True, interpret pattern as a regex. Invalid regex raises "
+            "an error rather than returning empty results."
+        ),
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Restrict search to notes under this prefix (e.g. 'projects/').",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Maximum matches to return (default 100, cap 1000).",
+    )
+
+
+class KeywordMatch(BaseModel):
+    """A single match in keyword search results."""
+
+    path: str = Field(description="Path of the note containing the match.")
+    line_number: int = Field(
+        ge=1,
+        description="Line number of the match (1-indexed).",
+    )
+    snippet: str = Field(
+        description=(
+            "The matched line, trimmed and truncated to ~200 characters. "
+            "Long lines end with '...' to indicate truncation."
+        ),
+    )
+
+
+class KeywordSearchOutput(BaseModel):
+    """Results of a keyword/regex search."""
+
+    matches: list[KeywordMatch] = Field(
+        description="Matches in scan order (notes lexicographic, then line order).",
+    )
+    total_matches: int = Field(
+        ge=0,
+        description=(
+            "Total matches found (may exceed len(matches) if truncated by limit)."
+        ),
+    )
+```
+
+**Errors:**
+- `LiveSyncMCPError` — invalid regex when `regex=True`.
+
+**Behavior:**
+- Empty `pattern` returns empty results (no error).
+- Iterates all live notes filtered by `path_prefix`; decryption errors
+  on individual notes are skipped silently.
+
+### `get_forward_links`
+
+Return notes that this note links to (outgoing `[[wikilinks]]`).
+Backed by an in-memory `LinkGraph` that's backfilled on server startup
+and kept fresh by the `_changes` subscriber, so queries are O(1) and
+the graph reflects the vault as of the most recent edit.
+
+```python
+class GetForwardLinksInput(BaseModel):
+    """Notes that this note links to."""
+
+    path: str = Field(description="Path of the note to query.")
+
+
+class LinkSearchOutput(BaseModel):
+    """Result of a forward-links or backlinks query."""
+
+    path: str = Field(description="The note path queried (echoed from input).")
+    forward_links: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Wikilink targets referenced by this note. Targets are basenames "
+            "as written in the [[...]] — they are NOT resolved to full paths "
+            "in this v1. Sorted alphabetically."
+        ),
+    )
+    backlinks: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Always empty for this tool — use `get_backlinks` or `get_links`."
+        ),
+    )
+```
+
+**Errors:** none. Unknown / missing paths return an empty list rather than raising.
+
+### `get_backlinks`
+
+Return notes that reference this note (incoming `[[wikilinks]]`).
+Same graph as `get_forward_links`. The query argument can be a full
+path or a bare basename — pass whatever appears between the `[[ ]]`
+brackets in the linking notes.
+
+```python
+class GetBacklinksInput(BaseModel):
+    """Notes that reference this note via [[wikilinks]]."""
+
+    path: str = Field(
+        description=(
+            "Path or basename of the note to query. Matches the target as "
+            "it appears between [[...]] in source notes."
+        ),
+    )
+
+
+# Output: shared LinkSearchOutput (see get_forward_links).
+# `backlinks` is populated; `forward_links` is empty.
+```
+
+**Errors:** none. Unknown / missing paths return an empty list rather than raising.
+
+### `get_links`
+
+Both forward and backlinks in a single call. Convenient when the LLM
+wants a full picture of a note's place in the graph and would
+otherwise issue two consecutive calls.
+
+```python
+class GetLinksInput(BaseModel):
+    """Both forward and backlinks for a note."""
+
+    path: str = Field(description="Path of the note to query.")
+
+
+# Output: shared LinkSearchOutput with both forward_links and backlinks populated.
+```
+
+**Errors:** none.
+
+### `recent_changes`
+
+Query the CouchDB `_changes` feed for vault modifications (create /
+update / delete events). Two filter modes:
+
+- **`since_seq: int`** — CouchDB sequence number. Preferred for
+  reliable resumable polling: no clock skew, no missed events. Save
+  the `watermark_seq` from each response and pass it as `since_seq`
+  on the next call.
+- **`since: str`** — human-friendly timestamp: relative (`"1h"`,
+  `"30m"`, `"7d"`) or ISO 8601 (`"2026-05-19T00:00:00Z"`). Falls back
+  to comparing `mtime`; sensitive to clock skew across devices.
+
+If both are given, `since_seq` wins.
+
+```python
+class RecentChangesInput(BaseModel):
+    """Query recent vault changes from the CouchDB _changes feed."""
+
+    since_seq: int | None = Field(
+        default=None,
+        description=(
+            "CouchDB sequence number to start from. Preferred for resumable "
+            "polling. If both since_seq and since are given, since_seq wins."
+        ),
+    )
+    since: str | None = Field(
+        default=None,
+        description=(
+            "Timestamp filter: '1h', '30m', '7d' (relative) or ISO 8601 "
+            "(e.g. '2026-05-19T00:00:00Z'). Uses mtime — clock-skew sensitive. "
+            "Prefer since_seq when possible."
+        ),
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Restrict to notes under this prefix.",
+    )
+    include_deleted: bool = Field(
+        default=True,
+        description="If False, omit soft-deleted notes from results.",
+    )
+    change_types: list[str] | None = Field(
+        default=None,
+        description=(
+            "Filter by type: subset of ['create', 'update', 'delete']. "
+            "None means all types."
+        ),
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Max events to return (default 100, cap 1000).",
+    )
+
+
+class ChangeItem(BaseModel):
+    """A single change event."""
+
+    path: str = Field(description="Path of the note affected.")
+    change_type: str = Field(description="'create', 'update', or 'delete'.")
+    mtime: datetime = Field(description="Timestamp of the change (ISO 8601, UTC).")
+    deleted: bool = Field(
+        description="True if soft-deleted. False otherwise.",
+    )
+    seq: int = Field(
+        description=(
+            "CouchDB sequence number. Use the highest seen as `since_seq` "
+            "on the next poll."
+        ),
+    )
+    size_bytes: int | None = Field(
+        default=None,
+        description="Size of the note in bytes (None for deleted notes).",
+    )
+
+
+class RecentChangesOutput(BaseModel):
+    """Results of a recent-changes query."""
+
+    changes: list[ChangeItem] = Field(
+        description="Changes matching the query, most recent first (by seq).",
+    )
+    watermark_seq: int = Field(
+        description=(
+            "Highest sequence number in the results. Pass this as "
+            "`since_seq` on the next call for incremental updates."
+        ),
+    )
+    total_available: int = Field(
+        ge=0,
+        description=(
+            "Total matches before the limit was applied. If "
+            "total_available > len(changes), results were truncated."
+        ),
+    )
+    truncated: bool = Field(
+        description=(
+            "True if more results exist beyond the limit. Re-poll with "
+            "the returned watermark_seq for the next batch."
+        ),
+    )
+```
+
+**Errors:** none under normal operation. Network failures from the
+underlying `_changes` request surface as the typed CouchDB errors used
+elsewhere.
+
+**Behavior:**
+- The MCP tool runs a one-shot `feed=normal` query — it doesn't share
+  the long-lived `_changes` stream used by the LinkGraph subscriber.
+- Results are sorted by seq descending (most recent first) before the
+  limit is applied, so truncation drops the oldest events.
 
 ---
 

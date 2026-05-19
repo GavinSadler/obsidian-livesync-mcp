@@ -22,8 +22,8 @@ class NoteModel(BaseModel):
     path: str = Field(description="Path of the note (echoed from input).")
     content: str = Field(
         description=(
-            "Full markdown content as UTF-8 text. "
-            "Frontmatter (if present) has been stripped into the `frontmatter` field. "
+            "Markdown content as UTF-8 text. "
+            "YAML frontmatter (if present) has been stripped into the `frontmatter` field. "
             "Whitespace and line endings in the body are preserved as stored."
         ),
     )

@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_server(settings: Settings) -> FastMCP:
-    """Create a FastMCP server with all 13 tools registered."""
+    """Create a FastMCP server with all 14 tools registered."""
     mcp = FastMCP("obsidian-livesync-mcp")
 
     couch = CouchDBClient(

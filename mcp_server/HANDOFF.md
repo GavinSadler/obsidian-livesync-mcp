@@ -11,8 +11,8 @@ This is a snapshot of progress on the MVP MCP server, written so you
   - `format`: `ruff format --check .` + `ruff check .`
   - `typecheck`: `mypy src tests` on Python 3.11 and 3.13
   - `test`: `pytest --cov` on Python 3.11 and 3.13
-- **DESIGN.md**: complete API spec for all 7 tools with Pydantic models
-  + Mermaid diagrams; updated to mark implemented items `[x]`. Includes
+- **DESIGN.md**: API spec for all 14 tools with Pydantic models +
+  Mermaid diagrams; updated to mark implemented items `[x]`. Includes
   a "Known gaps & compatibility risks" section tracking things to
   resolve before claiming plugin-compatibility.
 - **README.md**: quick-start updated; HKDF encryption (`%=`) supported
@@ -62,6 +62,11 @@ This is a snapshot of progress on the MVP MCP server, written so you
   `_changes` subscriber that keeps the graph fresh.
   `obsidian-livesync-mcp` console script is wired up.
 - `config.py` — `load_settings()` reads from env / `.env`.
+- `vector/{embeddings,indexer,store}.py` — stubs only; protocols and
+  class shells defined so the import graph compiles, but every method
+  raises `NotImplementedError`. The real implementation (embedding
+  backend, vector DB, `_changes` subscriber for indexing) is deferred
+  past the MVP. See DESIGN.md "Vector index" for the planned shape.
 
 ### Tests (169 total, all passing)
 - `tests/fake_couch.py` — in-memory `CouchDBClient` stand-in with
