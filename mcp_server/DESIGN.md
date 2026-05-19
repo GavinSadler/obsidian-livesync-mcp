@@ -88,16 +88,22 @@ where it materially affects results.
 - [x] `list_notes(folder?, limit?)` — list note paths in the vault.
       Supports prefix filter for folder-style browsing.
 - [x] `read_note(path)` — read full markdown content of a note. Handles
-      chunk reassembly + decompression. Encryption raises a clear error.
+      chunk reassembly + decompression. YAML frontmatter is parsed into
+      a `frontmatter` field and tags extracted into a `tags` field.
+- [x] `read_notes(paths)` — batch-read multiple notes in one call.
+      Per-path errors are reported in the result rather than raised.
 - [x] `create_note(path, content)` — create a new note. Fails if the path
       already exists.
 - [x] `update_note(path, content)` — overwrite the content of an existing
       note. Handles chunking + metadata updates.
+- [x] `append_note(path, content, separator?)` — append to an existing
+      note. Safer than read-then-update for incremental log-style writes.
 - [x] `delete_note(path)` — soft-delete a note (sets `deleted: true`).
 - [x] `move_note(old_path, new_path)` — rename/move a note. Atomic from
-      the caller's perspective; create-then-delete under the hood.
+      the caller's perspective; create-then-delete under the hood. Does
+      NOT auto-rewrite wikilinks pointing to old_path.
 
-### MCP tools — search
+### MCP tools — search & navigation
 
 - [~] `semantic_search(query, top_k?)` — vector similarity search over
       indexed note chunks. Response includes an `index_coverage:
@@ -106,6 +112,25 @@ where it materially affects results.
       **MVP: stub** — returns empty results with honest coverage stats
       reflecting no index built. Full implementation needs vector store
       + embedding backend + `_changes` subscriber.
+- [x] `keyword_search(pattern, case_sensitive?, regex?, path_prefix?, limit?)` —
+      literal-string or regex search over note content. Returns matches
+      with line numbers and snippets. Invalid regex raises a clear error.
+- [x] `get_forward_links(path)` — notes that this note links to (outgoing
+      `[[wikilinks]]`). Backed by an in-memory `LinkGraph` that's
+      backfilled on startup and kept fresh by the `_changes` subscriber.
+- [x] `get_backlinks(path)` — notes that reference this note (incoming
+      `[[wikilinks]]`). Same graph as above.
+- [x] `get_links(path)` — both forward and backlinks in a single call.
+
+### MCP tools — history
+
+- [x] `recent_changes(since_seq?, since?, path_prefix?, include_deleted?,
+      change_types?, limit?)` — recent create/update/delete events from
+      the CouchDB `_changes` feed. Two filter modes:
+      - `since_seq: int` — CouchDB sequence (reliable, resumable polling).
+      - `since: str` — "1h", "30m", "7d" (relative) or ISO 8601 (clock-skew sensitive).
+      Returns a `watermark_seq` that callers store and pass back as
+      `since_seq` on the next poll for incremental updates.
 
 ### LiveSync schema support
 
@@ -836,7 +861,23 @@ flowchart TD
                                   │   indexer.py     │  subscribes to _changes,
                                   │   store.py       │  writes to vector DB
                                   └──────────────────┘
+
+                                  ┌──────────────────┐
+                                  │  livesync/       │
+                                  │  links.py        │  in-memory LinkGraph;
+                                  │  recent_changes  │  forward + back links,
+                                  │                  │  fed by _changes feed
+                                  └──────────────────┘
 ```
+
+**Background tasks.** On startup, `server.py` backfills the `LinkGraph`
+by reading every note in the vault. While the server runs, a single
+`_changes` subscriber (`feed=continuous`, `since=graph.seq`) keeps the
+graph in sync with vault edits. The subscriber also tracks the watermark
+sequence; when the connection drops, it reconnects from the last seq.
+The same `_changes` feed will eventually feed the vector indexer
+(currently stubbed). The `recent_changes` MCP tool runs its own one-shot
+`feed=normal` query — it doesn't share the subscriber's stream.
 
 ## Deferred / backburner
 

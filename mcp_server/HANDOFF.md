@@ -39,16 +39,31 @@ This is a snapshot of progress on the MVP MCP server, written so you
 - `couchdb.py` — async httpx-based client (`get`, `put`, `bulk_get`,
   `bulk_docs`, `all_docs`, `changes` stream).
 - `errors.py` — typed exception hierarchy.
-- `tools/models.py` — shared Pydantic models (`NoteModel`,
-  `ListNotesOutput`, `SearchHit`, `IndexCoverage`, etc.).
-- `tools/notes.py` — 6 CRUD MCP adapters.
-- `tools/search.py` — `semantic_search` stub returning empty results
-  with honest `index_coverage` (indexed=0, total=N).
-- `server.py` — FastMCP-based entry point registering all 7 tools.
+- `tools/models.py` — shared Pydantic models (`NoteModel` with
+  frontmatter/tags, `ListNotesOutput`, `SearchHit`, `IndexCoverage`,
+  `LinkSearchOutput`, `KeywordSearchOutput`, `BatchReadOutput`,
+  `AppendNoteOutput`, `RecentChangesOutput`, etc.).
+- `tools/notes.py` — CRUD + `read_notes` (batch) + `append_note`.
+- `tools/search.py` — `semantic_search` stub (empty + honest
+  `index_coverage`) + `keyword_search` (literal / regex over content).
+- `tools/links.py` — `get_forward_links`, `get_backlinks`, `get_links`
+  backed by the in-memory `LinkGraph`.
+- `tools/history.py` — `recent_changes` over CouchDB `_changes` with
+  sequence- or timestamp-based filtering and a returned `watermark_seq`.
+- `livesync/links.py` — bidirectional wikilink graph + parser
+  (`[[target]]`, `[[target|alias]]`, `[[target#heading]]`).
+- `livesync/recent_changes.py` — change-record filtering and `since`
+  parameter parsing ("1h", ISO 8601, sequence).
+- `livesync/models.py` — `extract_frontmatter` + `extract_tags` for
+  YAML frontmatter (Jekyll/Hugo style).
+- `server.py` — FastMCP entry point registering all 14 tools. On
+  startup, fetches PBKDF2 salt, backfills the `LinkGraph` from the
+  vault, then runs the MCP stdio loop alongside a background
+  `_changes` subscriber that keeps the graph fresh.
   `obsidian-livesync-mcp` console script is wired up.
 - `config.py` — `load_settings()` reads from env / `.env`.
 
-### Tests (77 total, all passing)
+### Tests (169 total, all passing)
 - `tests/fake_couch.py` — in-memory `CouchDBClient` stand-in with
   realistic MVCC semantics (rev tracking, 409 on stale writes).
 - `test_paths.py` (11) — plain & obfuscated round-trips, leading-`_`
@@ -69,7 +84,20 @@ This is a snapshot of progress on the MVP MCP server, written so you
 - `test_tools.py` (8) — MCP adapter layer: Pydantic conversion, ISO
   timestamps, folder normalization, semantic_search empty + honest
   coverage.
-- `test_smoke.py` (2) — package imports.
+- `test_frontmatter.py` (17) — YAML frontmatter extraction + tag
+  parsing (lists, comma-strings, keywords field, dedupe).
+- `test_links.py` (26) — wikilink regex (`[[name]]`, `[[name|alias]]`,
+  `[[name#heading]]`), basename → path resolution with shortest-path
+  tiebreaker, `LinkGraph` forward/backlink upsert + delete + rebuild.
+- `test_recent_changes.py` (20) — `ChangeRecord` shape,
+  `parse_since_param` (None / int / "1h" / ISO 8601 / invalid),
+  filter by path prefix / deleted / change type, watermark update.
+- `test_new_tools.py` (29) — batch read, append, frontmatter on read,
+  keyword search (literal / case / regex / prefix / limit), links
+  (forward / back / both / missing), recent changes (path prefix,
+  since_seq, deleted, limit, watermark).
+- `test_smoke.py` (2) — package imports (incl. links, history,
+  recent_changes modules).
 
 ## What's NOT done (next-PR candidates)
 

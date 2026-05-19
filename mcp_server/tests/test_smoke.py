@@ -14,10 +14,14 @@ def test_subpackages_import() -> None:
     from obsidian_livesync_mcp.livesync import (  # noqa: F401
         chunks,
         encryption,
+        links,
         models,
         notes,
         paths,
+        recent_changes,
     )
+    from obsidian_livesync_mcp.tools import history as tool_history  # noqa: F401
+    from obsidian_livesync_mcp.tools import links as tool_links  # noqa: F401
     from obsidian_livesync_mcp.tools import notes as tool_notes  # noqa: F401
     from obsidian_livesync_mcp.tools import search as tool_search  # noqa: F401
     from obsidian_livesync_mcp.vector import embeddings, indexer, store  # noqa: F401
