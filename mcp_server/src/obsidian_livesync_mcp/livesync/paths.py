@@ -30,16 +30,38 @@ def _stretch_hash(value: str) -> str:
     return data.hex()
 
 
-def path_to_id(path: str, *, obfuscate: bool = False, passphrase: str | None = None) -> str:
-    """Convert an Obsidian file path to a LiveSync document ID."""
+def path_to_id(
+    path: str,
+    *,
+    obfuscate: bool = False,
+    passphrase: str | None = None,
+    case_sensitive: bool = False,
+) -> str:
+    """Convert an Obsidian file path to a LiveSync document ID.
+
+    ``case_sensitive`` mirrors the plugin's "Handle files as Case-Sensitive"
+    setting. The default (``False``) is the plugin's recommended default: the
+    document ID is lowercased so the same note can't collide across
+    case-insensitive filesystems (Windows/macOS/Android). The real filename
+    case is preserved separately in the doc's ``path`` field, not the ID.
+
+    Verified against a real exported vault: every note doc had
+    ``_id == path.lower()`` in plain mode.
+    """
     if not path:
         raise ValueError("path must be non-empty")
 
     if obfuscate:
         if not passphrase:
             raise ValueError("obfuscated mode requires a passphrase")
+        # NOTE: whether the plugin lowercases the path before obfuscation
+        # hashing is not yet verified against an obfuscated-vault export, so
+        # we intentionally do not apply case folding here yet.
         hashed_passphrase = _stretch_hash(passphrase)
         return PREFIX_OBFUSCATED + _stretch_hash(f"{hashed_passphrase}:{path}")
+
+    if not case_sensitive:
+        path = path.lower()
 
     # Plain mode: prepend "/" if path begins with "_" to avoid colliding
     # with CouchDB reserved IDs (_design, _local, etc.).

@@ -232,20 +232,35 @@ async def test_subfolder_and_spaced_paths_read(repo: NoteRepository, vault: Load
 
 
 # --------------------------------------------------------------------------
-# KNOWN GAPS — pinned as strict xfail so a fix flips them red->green loudly
+# Case-insensitive path handling (matches the plugin default; was a gap)
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="path_to_id() does not lowercase in plain mode, but the plugin "
-    "stores IDs lowercased (case-insensitive default). read() by the "
-    "real-case path returned by list_notes therefore 404s.",
-)
-async def test_read_by_truecase_path_should_work(repo: NoteRepository) -> None:
-    # The LLM gets "README.md" from list_notes and should be able to read it.
+async def test_read_by_truecase_path_resolves(repo: NoteRepository) -> None:
+    """The LLM gets "README.md" from list_notes and must be able to read it.
+
+    The plugin stores IDs lowercased by default (case-insensitive), while the
+    real-case filename lives in the doc's `path` field. NoteRepository folds
+    case when building the lookup ID, so the true-case path resolves and the
+    returned note still reports the real-case path.
+    """
     note = await repo.read("README.md")
     assert note is not None
+    assert note.path == "README.md"
+    assert "Fixture Vault Documentation" in note.content
+
+
+async def test_read_is_case_insensitive_for_arbitrary_casing(repo: NoteRepository) -> None:
+    # Any casing of a stored path should resolve to the same note.
+    for variant in ("README.MD", "ReadMe.md", "readme.md"):
+        note = await repo.read(variant)
+        assert note is not None, f"{variant!r} failed to resolve"
+        assert note.path == "README.md"
+
+
+# --------------------------------------------------------------------------
+# KNOWN GAPS — pinned as strict xfail so a fix flips them red->green loudly
+# --------------------------------------------------------------------------
 
 
 @pytest.mark.xfail(

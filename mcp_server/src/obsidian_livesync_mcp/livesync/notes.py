@@ -124,11 +124,13 @@ class NoteRepository:
         passphrase: str | None = None,
         pbkdf2_salt: bytes | None = None,
         obfuscate_paths: bool = False,
+        case_sensitive: bool = False,
     ) -> None:
         self._couch = couch
         self._passphrase = passphrase
         self._pbkdf2_salt = pbkdf2_salt
         self._obfuscate = obfuscate_paths
+        self._case_sensitive = case_sensitive
         if obfuscate_paths and not passphrase:
             raise ValueError("obfuscated paths require a passphrase")
         if passphrase and pbkdf2_salt is None:
@@ -137,7 +139,12 @@ class NoteRepository:
             pass
 
     def _path_to_id(self, path: str) -> str:
-        return path_to_id(path, obfuscate=self._obfuscate, passphrase=self._passphrase)
+        return path_to_id(
+            path,
+            obfuscate=self._obfuscate,
+            passphrase=self._passphrase,
+            case_sensitive=self._case_sensitive,
+        )
 
     def set_pbkdf2_salt(self, salt: bytes) -> None:
         """Inject the vault PBKDF2 salt fetched at startup."""
