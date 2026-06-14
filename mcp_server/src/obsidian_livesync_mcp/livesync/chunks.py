@@ -189,6 +189,124 @@ def split_content(
     return result
 
 
+def _js_to_int32(x: int) -> int:
+    """Mirror JavaScript ``x | 0`` (ToInt32)."""
+    x &= 0xFFFFFFFF
+    return x - 0x100000000 if x >= 0x80000000 else x
+
+
+def _js_imul(a: int, b: int) -> int:
+    """Mirror JavaScript ``Math.imul`` (32-bit signed integer multiply)."""
+    r = ((a & 0xFFFFFFFF) * (b & 0xFFFFFFFF)) & 0xFFFFFFFF
+    return r - 0x100000000 if r >= 0x80000000 else r
+
+
+# Rabin-Karp (V3 "Fine deduplication") constants, from
+# livesync-commonlib/src/string_and_binary/chunks.ts (splitPiecesRabinKarp).
+RK_WINDOW_SIZE = 48
+RK_PRIME = 31
+RK_BOUNDARY_PATTERN = 1
+RK_CHUNK_UNIT_PLAIN = 64  # bytes; base unit for text
+RK_MAX_CHUNK_COUNT = 500
+RK_ABS_MAX_FLOOR = 30 * 1024
+RK_PLAIN_SPLIT_LIMIT = 4 * 1024 * 1024  # files >= 4 MiB fall back to binary path
+
+
+def split_pieces_rabin_karp(
+    content: str,
+    *,
+    absolute_max_piece_size: int = DEFAULT_PIECE_SIZE,
+    minimum_chunk_size: int = DEFAULT_MINIMUM_CHUNK_SIZE,
+) -> list[str]:
+    """Split note content with the V3 Rabin-Karp content-defined splitter.
+
+    Verbatim port of ``splitPiecesRabinKarp`` (text path) from
+    ``livesync-commonlib/src/string_and_binary/chunks.ts``. Boundaries are
+    content-defined: a rolling hash over the trailing ``RK_WINDOW_SIZE`` bytes
+    triggers a cut when ``(hash >>> 0) % avgChunkSize == 1`` once the chunk is
+    at least ``minChunkSize``, with a hard cut at ``maxChunkSize``.
+
+    Operates on UTF-8 *bytes* (not UTF-16 code units): the buffer is the
+    UTF-8 encoding of ``content`` and each emitted piece is the UTF-8 decode
+    of a byte range. A boundary is suppressed when the next byte is a UTF-8
+    continuation byte (``0b10xxxxxx``) so multi-byte characters never split.
+
+    The JS 32-bit integer semantics (``Math.imul`` and ``| 0``) are mirrored
+    exactly via :func:`_js_imul` / :func:`_js_to_int32`, which is required for
+    boundary parity with plugin-written chunks.
+
+    Verified byte-identical against a real V3 vault export: 38/38 notes
+    reproduced the plugin's ``children`` chunk IDs exactly.
+    """
+    if not content:
+        return []
+
+    data = content.encode("utf-8")
+    data_size = len(data)
+
+    plain_split = data_size < RK_PLAIN_SPLIT_LIMIT
+    chunk_unit = RK_CHUNK_UNIT_PLAIN
+    if plain_split:
+        while data_size / (chunk_unit * 4) > RK_MAX_CHUNK_COUNT:
+            chunk_unit += 32
+
+    if plain_split:
+        fixed_avg = chunk_unit * 4
+        fixed_max = chunk_unit * 16
+        fixed_min = chunk_unit * 2
+    else:
+        chunk_unit_binary = 256 * 1024
+        fixed_avg = chunk_unit_binary * 4
+        fixed_max = chunk_unit_binary * 16
+        fixed_min = chunk_unit_binary
+
+    effective_abs_max = max(absolute_max_piece_size, RK_ABS_MAX_FLOOR)
+    max_chunk_size = min(fixed_max, effective_abs_max)
+    min_chunk_size = min(max(fixed_min, minimum_chunk_size), max_chunk_size)
+    avg_chunk_size = min(max(fixed_avg, min_chunk_size), max_chunk_size)
+
+    p_pow_w = 1
+    for _ in range(RK_WINDOW_SIZE - 1):
+        p_pow_w = _js_imul(p_pow_w, RK_PRIME)
+
+    pieces: list[str] = []
+    pos = 0
+    start = 0
+    h = 0
+    length = data_size
+    while pos < length:
+        byte = data[pos]
+        if pos >= start + RK_WINDOW_SIZE:
+            old_term = _js_imul(data[pos - RK_WINDOW_SIZE], p_pow_w)
+            h = _js_to_int32(h - old_term)
+            h = _js_imul(h, RK_PRIME)
+            h = _js_to_int32(h + byte)
+        else:
+            h = _js_imul(h, RK_PRIME)
+            h = _js_to_int32(h + byte)
+
+        current_chunk_size = pos - start + 1
+        boundary = False
+        if current_chunk_size >= min_chunk_size and (h & 0xFFFFFFFF) % avg_chunk_size == (
+            RK_BOUNDARY_PATTERN
+        ):
+            boundary = True
+        if current_chunk_size >= max_chunk_size:
+            boundary = True
+
+        if boundary:
+            # Don't cut in the middle of a UTF-8 multi-byte sequence.
+            safe = not (pos + 1 < length and (data[pos + 1] & 0xC0) == 0x80)
+            if safe:
+                pieces.append(data[start : pos + 1].decode("utf-8"))
+                start = pos + 1
+        pos += 1
+
+    if start < length:
+        pieces.append(data[start:length].decode("utf-8"))
+    return pieces
+
+
 def hash_chunk(chunk: str, *, encrypted: bool = False) -> str:
     """Return the ``h:`` (or ``h:+``) chunk document ID for a piece of content.
 

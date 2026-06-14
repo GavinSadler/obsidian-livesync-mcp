@@ -23,7 +23,7 @@ from ..errors import (
     NoteWriteError,
 )
 from . import encryption
-from .chunks import hash_chunk, split_content
+from .chunks import hash_chunk, split_content, split_pieces_rabin_karp
 from .paths import path_to_id
 
 WRITE_RETRY_LIMIT = 3
@@ -125,12 +125,16 @@ class NoteRepository:
         pbkdf2_salt: bytes | None = None,
         obfuscate_paths: bool = False,
         case_sensitive: bool = False,
+        chunk_splitter: str = "v3",
     ) -> None:
         self._couch = couch
         self._passphrase = passphrase
         self._pbkdf2_salt = pbkdf2_salt
         self._obfuscate = obfuscate_paths
         self._case_sensitive = case_sensitive
+        if chunk_splitter not in ("v2", "v3"):
+            raise ValueError(f"unknown chunk_splitter {chunk_splitter!r} (expected 'v2' or 'v3')")
+        self._chunk_splitter = chunk_splitter
         if obfuscate_paths and not passphrase:
             raise ValueError("obfuscated paths require a passphrase")
         if passphrase and pbkdf2_salt is None:
@@ -270,7 +274,10 @@ class NoteRepository:
                 "LIVESYNC_PASSPHRASE is set but the vault PBKDF2 salt is not loaded; "
                 "cannot write encrypted chunks"
             )
-        pieces = split_content(content)
+        if self._chunk_splitter == "v3":
+            pieces = split_pieces_rabin_karp(content)
+        else:
+            pieces = split_content(content)
         children: list[str] = []
         docs: list[dict[str, Any]] = []
         seen: set[str] = set()

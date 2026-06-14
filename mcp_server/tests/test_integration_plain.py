@@ -3,9 +3,9 @@
 Unlike the unit tests, these load a JSON snapshot of an *actual* Obsidian
 LiveSync CouchDB database produced by the real plugin (V3 chunk splitter,
 case-insensitive path handling) and run the real `NoteRepository` against
-it. They validate that our reading / hashing / reassembly logic is
-byte-compatible with genuine plugin output — and pin the gaps where it is
-not yet (marked xfail).
+it. They validate that our reading / hashing / reassembly / splitting logic
+is byte-compatible with genuine plugin output, including case-insensitive
+path resolution and full V3 Rabin-Karp chunk-boundary parity.
 
 Fixture: mcp_server/fixtures/plain/  (E2EE off, path obfuscation off)
 """
@@ -17,7 +17,7 @@ from typing import cast
 import pytest
 
 from obsidian_livesync_mcp.couchdb import CouchDBClient
-from obsidian_livesync_mcp.livesync.chunks import hash_chunk, split_content
+from obsidian_livesync_mcp.livesync.chunks import hash_chunk, split_pieces_rabin_karp
 from obsidian_livesync_mcp.livesync.links import LinkGraph
 from obsidian_livesync_mcp.livesync.models import extract_frontmatter
 from obsidian_livesync_mcp.livesync.notes import NoteRepository, _decode_chunk_payload
@@ -259,21 +259,53 @@ async def test_read_is_case_insensitive_for_arbitrary_casing(repo: NoteRepositor
 
 
 # --------------------------------------------------------------------------
-# KNOWN GAPS — pinned as strict xfail so a fix flips them red->green loudly
+# V3 Rabin-Karp splitter parity (this vault was written by the V3 splitter)
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="split_content() ports the V2 splitter; this vault was written by "
-    "the V3 Rabin-Karp splitter, so re-splitting assembled content does "
-    "not reproduce the plugin's children chunk IDs.",
-)
-async def test_splitter_reproduces_plugin_children(
+async def test_v3_splitter_reproduces_readme_children(
     repo: NoteRepository, vault: LoadedVault
 ) -> None:
     doc = vault.raw_docs["readme.md"]
     note = await repo.read("readme.md")
     assert note is not None
-    our_children = [hash_chunk(p) for p in split_content(note.content)]
+    our_children = [hash_chunk(p) for p in split_pieces_rabin_karp(note.content)]
     assert our_children == doc["children"]
+
+
+async def test_v3_splitter_reproduces_every_note(repo: NoteRepository, vault: LoadedVault) -> None:
+    """The V3 port must reproduce the plugin's children for EVERY note.
+
+    This is the strongest write-side compatibility signal: if we re-split the
+    assembled content of each note, the resulting chunk IDs must match the
+    plugin's exactly, so writes reuse (dedup against) existing chunks.
+    """
+    failures: list[str] = []
+    for doc_id in _live_note_ids(vault):
+        doc = vault.raw_docs[doc_id]
+        if not doc.get("children"):
+            continue
+        note = await repo.read(doc_id)
+        assert note is not None
+        ours = [hash_chunk(p) for p in split_pieces_rabin_karp(note.content)]
+        if ours != doc["children"]:
+            failures.append(f"{doc_id} (plugin={len(doc['children'])} ours={len(ours)})")
+    assert not failures, f"{len(failures)} notes did not reproduce: {failures[:5]}"
+
+
+async def test_repository_write_produces_v3_chunks(
+    repo: NoteRepository, vault: LoadedVault
+) -> None:
+    """A NoteRepository write (default splitter) reproduces the plugin's chunks.
+
+    Reads the real readme content, writes it to a fresh path, and checks the
+    stored parent doc's children match the plugin's chunk IDs for readme — i.e.
+    our write path is byte-compatible with the V3 splitter, not just the
+    standalone function.
+    """
+    source = await repo.read("readme.md")
+    assert source is not None
+    await repo.create("roundtrip-readme.md", source.content)
+    written = await vault.couch.get("roundtrip-readme.md")
+    assert written is not None
+    assert written["children"] == vault.raw_docs["readme.md"]["children"]
