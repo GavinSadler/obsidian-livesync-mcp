@@ -53,7 +53,7 @@ def repo(vault: LoadedVault) -> NoteRepository:
         cast(CouchDBClient, vault.couch),
         passphrase=PASSPHRASE,
         pbkdf2_salt=vault.salt,
-        obfuscate=True,
+        obfuscate_paths=True,
         case_sensitive=False,
     )
 
@@ -183,7 +183,9 @@ async def test_read_by_obfuscated_path_resolves(repo: NoteRepository) -> None:
     assert note.path == "README.md"
 
 
-async def test_list_paths_works_in_obfuscated_mode(repo: NoteRepository, vault: LoadedVault) -> None:
+async def test_list_paths_works_in_obfuscated_mode(
+    repo: NoteRepository, vault: LoadedVault
+) -> None:
     """list_paths() must surface all live notes even with obfuscated IDs."""
     listed = {item["path"] for item in await repo.list_paths()}
     # Sanity check: should have at least 2 notes
