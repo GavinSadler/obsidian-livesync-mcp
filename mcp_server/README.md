@@ -50,6 +50,42 @@ VECTOR_ENABLED=true
 VECTOR_EMBEDDING_BACKEND=openai
 ```
 
+## Testing
+
+`uv run pytest` runs the full suite, including integration tests that load
+**real exported-vault fixtures** (`fixtures/{plain,encrypted,obfuscated}/`)
+into an in-memory CouchDB and run the real repository against genuine plugin
+output. These need no server and validate read/decrypt/split parity.
+
+### Live CouchDB tests (opt-in)
+
+`tests/test_integration_live.py` exercises the parts a fake DB can't reach —
+the real HTTP client, write/conflict paths, and full write→read-back
+round-trips. It's **skipped unless `COUCHDB_URL` is set**. To run it against a
+local CouchDB using the author's own scripts:
+
+```bash
+# from the repo root — start + configure CouchDB (couchdb:3.5.0 on :5989)
+username=admin password=testpassword bash src/apps/cli/util/couchdb-start.sh
+hostname=http://127.0.0.1:5989/ username=admin password=testpassword \
+    dbname=livesync-test-db-ci node=_local bash src/apps/cli/util/couchdb-init.sh
+
+# then run the live tests
+cd mcp_server
+COUCHDB_URL=http://127.0.0.1:5989 COUCHDB_USERNAME=admin \
+    COUCHDB_PASSWORD=testpassword uv run pytest tests/test_integration_live.py -v
+
+# stop it when done
+bash ../src/apps/cli/util/couchdb-stop.sh
+```
+
+Each fixture is loaded into a throwaway `mcp-live-<vault>` database (dropped +
+recreated each run) via `scripts/load_fixture.py`, so it never touches a real
+vault. The same flow runs automatically in CI (the `live` job in
+`.github/workflows/mcp-ci.yml`). Writes are verified for the plain and
+encrypted vaults; obfuscated + Property-Encrypted vaults are read-only here,
+since the write path doesn't re-encrypt the metadata blob.
+
 ## Layout
 
 ```

@@ -27,14 +27,18 @@ class CouchDBClient:
         username: str | None = None,
         password: str | None = None,
         verify_tls: bool = True,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         auth = (username, password) if username and password else None
         self._base = url.rstrip("/")
         self._db = database
+        # `transport` is a test seam (e.g. httpx.MockTransport); None uses the
+        # default network transport.
         self._client = httpx.AsyncClient(
             auth=auth,
             verify=verify_tls,
             timeout=httpx.Timeout(30.0, connect=10.0),
+            transport=transport,
         )
 
     async def close(self) -> None:
@@ -47,7 +51,13 @@ class CouchDBClient:
         await self.close()
 
     def _doc_url(self, doc_id: str) -> str:
-        # CouchDB allows `/` in doc IDs, but they must be encoded.
+        # CouchDB allows `/` in doc IDs, but it must be percent-encoded so the
+        # whole id is one path segment — except for the `_design/` and `_local/`
+        # namespaces, whose leading `/` is structural and must stay literal
+        # (e.g. the sync-parameters doc `_local/obsidian_livesync_sync_parameters`).
+        for prefix in ("_design/", "_local/"):
+            if doc_id.startswith(prefix):
+                return f"{self._base}/{self._db}/{prefix}{quote(doc_id[len(prefix) :], safe='')}"
         return f"{self._base}/{self._db}/{quote(doc_id, safe='')}"
 
     def _db_url(self, path: str = "") -> str:

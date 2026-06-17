@@ -85,3 +85,46 @@ jobs:
         with:
           directory: ./mcp_server
           fail_ci_if_error: false
+
+  live:
+    # End-to-end tests against a real CouchDB, booted with the author's own
+    # scripts (couchdb:3.5.0). Loads the exported fixtures into throwaway
+    # databases and runs the real client/repository — covering the HTTP client,
+    # write/conflict paths, and write→read-back round-trips the fake DB can't.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+
+      - name: Install dependencies
+        run: cd mcp_server && uv sync
+
+      - name: Start + initialise CouchDB
+        env:
+          username: admin
+          password: testpassword
+          hostname: http://127.0.0.1:5989/
+          dbname: livesync-test-db-ci
+          node: _local
+        run: |
+          bash src/apps/cli/util/couchdb-start.sh
+          bash src/apps/cli/util/couchdb-init.sh
+
+      - name: Run live integration tests
+        working-directory: mcp_server
+        env:
+          COUCHDB_URL: http://127.0.0.1:5989
+          COUCHDB_USERNAME: admin
+          COUCHDB_PASSWORD: testpassword
+        run: uv run pytest tests/test_integration_live.py -v
+
+      - name: Stop CouchDB
+        if: always()
+        run: bash src/apps/cli/util/couchdb-stop.sh || true
