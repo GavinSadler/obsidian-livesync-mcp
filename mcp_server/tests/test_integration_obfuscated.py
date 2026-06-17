@@ -122,9 +122,8 @@ def test_obfuscation_path_to_id_matches_plugin(vault: LoadedVault) -> None:
         our_id = path_to_id(path, obfuscate=True, passphrase=PASSPHRASE, case_sensitive=False)
         if our_id != doc_id:
             mismatches.append((path, doc_id, our_id))
-    assert not mismatches, (
-        f"{len(mismatches)} obfuscated paths did not reproduce:\n"
-        + "\n".join(f"  {path}: plugin={pid} ours={oid}" for path, pid, oid in mismatches[:5])
+    assert not mismatches, f"{len(mismatches)} obfuscated paths did not reproduce:\n" + "\n".join(
+        f"  {path}: plugin={pid} ours={oid}" for path, pid, oid in mismatches[:5]
     )
 
 
@@ -161,9 +160,7 @@ def test_obfuscated_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> No
         if not doc_id.startswith("h:"):
             continue
         try:
-            raw = _decode_chunk_payload(
-                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt
-            )
+            raw = _decode_chunk_payload(doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
             if hash_chunk(raw, encrypted=True) != doc_id:
                 mismatches.append(doc_id)
         except Exception:
@@ -258,9 +255,7 @@ async def test_frontmatter_extracted_from_obfuscated_readme(
     assert "Fixture Vault Documentation" in body
 
 
-async def test_link_backfill_in_obfuscated_vault(
-    repo: NoteRepository, vault: LoadedVault
-) -> None:
+async def test_link_backfill_in_obfuscated_vault(repo: NoteRepository, vault: LoadedVault) -> None:
     """Wikilinks in obfuscated content must be extractable for link graph."""
     graph = LinkGraph()
     notes: dict[str, str] = {}

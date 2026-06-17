@@ -127,9 +127,7 @@ def test_encrypted_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> Non
         if not doc_id.startswith("h:"):
             continue
         try:
-            raw = _decode_chunk_payload(
-                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt
-            )
+            raw = _decode_chunk_payload(doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
             if hash_chunk(raw, encrypted=True) != doc_id:
                 mismatches.append(doc_id)
         except Exception:
