@@ -24,7 +24,7 @@ from obsidian_livesync_mcp.livesync.notes import NoteRepository, _decode_chunk_p
 from .fixture_loader import LoadedVault, load_vault
 
 VAULT_NAME = "encrypted"
-PASSPHRASE = "test-passphrase-123"
+PASSPHRASE = "ThisIsMyObsidianNotebook1234"
 
 # Skip the whole module cleanly if the fixture export isn't present.
 try:
