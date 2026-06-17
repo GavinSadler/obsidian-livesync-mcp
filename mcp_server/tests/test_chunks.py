@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import pytest
+
 from obsidian_livesync_mcp.livesync.chunks import (
     DEFAULT_MINIMUM_CHUNK_SIZE,
     DEFAULT_PIECE_SIZE,
     MAX_ITEMS,
     assemble_chunks,
     hash_chunk,
+    hashed_passphrase,
     split_content,
 )
 
@@ -98,8 +101,14 @@ def test_hash_chunk_distinguishes_content() -> None:
 
 
 def test_hash_chunk_encrypted_marker() -> None:
-    assert hash_chunk("hello", encrypted=True).startswith("h:+")
+    hp = hashed_passphrase("correct horse battery staple")
+    assert hash_chunk("hello", encrypted=True, hashed_passphrase=hp).startswith("h:+")
     assert not hash_chunk("hello", encrypted=False).startswith("h:+")
+
+
+def test_hash_chunk_encrypted_requires_hashed_passphrase() -> None:
+    with pytest.raises(ValueError):
+        hash_chunk("hello", encrypted=True)
 
 
 # Reference outputs captured from a verbatim port of splitPieces2V2's text

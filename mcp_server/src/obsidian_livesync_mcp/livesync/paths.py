@@ -1,9 +1,10 @@
 """Path ↔ document ID conversion.
 
-Plain mode: ID is essentially the path (with a leading-underscore guard).
-Obfuscated mode: ID is `f:` + hex(SHA-256(stretched_passphrase + ":" + path)).
+Plain mode: ID is essentially the path (lowercased unless case-sensitive).
+Obfuscated mode: ID is ``f:`` + hex(SHA-256(``hashedPassphrase:lower(path)``)),
+where ``hashedPassphrase`` is itself SHA-256(passphrase).
 
-Reference: src/lib/src/string_and_binary/path.ts (path2id_base, id2path_base).
+Reference: livesync-commonlib src/string_and_binary/path.ts (path2id_base).
 """
 
 from __future__ import annotations
@@ -14,20 +15,16 @@ PREFIX_OBFUSCATED = "f:"
 PREFIX_CHUNK = "h:"
 
 
-def _stretch_hash(value: str) -> str:
-    """Mirror the LiveSync passphrase stretching loop.
+def _hash_string(value: str) -> str:
+    """Mirror LiveSync's ``hashString``: a single SHA-256 over UTF-8 bytes, hex.
 
-    Plugin calls SHA-256 in a loop `key.length` times, where `key.length`
-    is the input string's character count. We do the same: start with the
-    UTF-8 bytes, hash once per character, hex-encode the final digest.
-
-    See DESIGN.md "Known gaps" — the precise semantics of `key.length`
-    in the JS source are inferred and need real-vault verification.
+    The plugin's ``_hashString`` has a "stretching" loop that re-hashes the
+    *original* buffer every iteration instead of the running digest (an upstream
+    bug in livesync-commonlib), so it collapses to one SHA-256. We replicate that
+    exactly. Verified against a real obfuscated-vault export: reproduces all 38
+    ``f:`` document IDs.
     """
-    data = value.encode("utf-8")
-    for _ in range(len(value)):
-        data = hashlib.sha256(data).digest()
-    return data.hex()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def path_to_id(
@@ -54,11 +51,12 @@ def path_to_id(
     if obfuscate:
         if not passphrase:
             raise ValueError("obfuscated mode requires a passphrase")
-        # NOTE: whether the plugin lowercases the path before obfuscation
-        # hashing is not yet verified against an obfuscated-vault export, so
-        # we intentionally do not apply case folding here yet.
-        hashed_passphrase = _stretch_hash(passphrase)
-        return PREFIX_OBFUSCATED + _stretch_hash(f"{hashed_passphrase}:{path}")
+        # The plugin lowercases the filename before hashing when case-insensitive
+        # (its default), but hashes the passphrase as-is. Verified against a real
+        # obfuscated-vault export.
+        filename = path if case_sensitive else path.lower()
+        hashed_passphrase = _hash_string(passphrase)
+        return PREFIX_OBFUSCATED + _hash_string(f"{hashed_passphrase}:{filename}")
 
     if not case_sensitive:
         path = path.lower()

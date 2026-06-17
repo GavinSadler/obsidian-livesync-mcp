@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import os
 import zlib
+from functools import lru_cache
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -66,11 +67,15 @@ class EncryptionNotSupportedError(NotImplementedError):
     """
 
 
+@lru_cache(maxsize=8)
 def derive_master_key(passphrase: str, pbkdf2_salt: bytes) -> bytes:
     """PBKDF2-HMAC-SHA256(310 000 iter), 32-byte output.
 
     Matches octagonal-wheels' ``deriveMasterKey``: feeds raw UTF-8
     passphrase bytes into PBKDF2 (no pre-hash).
+
+    Cached: the master key depends only on (passphrase, vault salt), so we
+    derive it once per vault instead of paying 310 000 iterations per chunk.
     """
     if len(pbkdf2_salt) != PBKDF2_SALT_LENGTH:
         raise ValueError(f"pbkdf2_salt must be {PBKDF2_SALT_LENGTH} bytes, got {len(pbkdf2_salt)}")

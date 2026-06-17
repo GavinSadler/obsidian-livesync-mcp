@@ -16,7 +16,11 @@ from typing import cast
 import pytest
 
 from obsidian_livesync_mcp.couchdb import CouchDBClient
-from obsidian_livesync_mcp.livesync.chunks import hash_chunk, split_pieces_rabin_karp
+from obsidian_livesync_mcp.livesync.chunks import (
+    hash_chunk,
+    hashed_passphrase,
+    split_pieces_rabin_karp,
+)
 from obsidian_livesync_mcp.livesync.links import LinkGraph
 from obsidian_livesync_mcp.livesync.models import extract_frontmatter
 from obsidian_livesync_mcp.livesync.notes import NoteRepository, _decode_chunk_payload
@@ -25,6 +29,8 @@ from .fixture_loader import LoadedVault, load_vault
 
 VAULT_NAME = "encrypted"
 PASSPHRASE = "ThisIsMyObsidianNotebook1234"
+# Per-vault salt the plugin mixes into encrypted chunk IDs.
+HASHED_PASSPHRASE = hashed_passphrase(PASSPHRASE)
 
 # Skip the whole module cleanly if the fixture export isn't present.
 try:
@@ -158,7 +164,12 @@ def test_encrypted_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> Non
             continue
         try:
             raw = _decode_chunk_payload(doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
-            if hash_chunk(raw, encrypted=_chunk_is_encrypted(doc_id)) != doc_id:
+            if (
+                hash_chunk(
+                    raw, encrypted=_chunk_is_encrypted(doc_id), hashed_passphrase=HASHED_PASSPHRASE
+                )
+                != doc_id
+            ):
                 mismatches.append(doc_id)
         except Exception:
             mismatches.append(doc_id)
@@ -221,7 +232,10 @@ async def test_v3_splitter_reproduces_encrypted_readme_children(
     note = await repo.read("readme.md")
     assert note is not None
     enc = _children_encrypted(doc)
-    our_children = [hash_chunk(p, encrypted=enc) for p in split_pieces_rabin_karp(note.content)]
+    our_children = [
+        hash_chunk(p, encrypted=enc, hashed_passphrase=HASHED_PASSPHRASE)
+        for p in split_pieces_rabin_karp(note.content)
+    ]
     assert our_children == doc["children"]
 
 
@@ -237,7 +251,10 @@ async def test_v3_splitter_reproduces_encrypted_every_note(
         note = await repo.read(doc_id)
         assert note is not None
         enc = _children_encrypted(doc)
-        ours = [hash_chunk(p, encrypted=enc) for p in split_pieces_rabin_karp(note.content)]
+        ours = [
+            hash_chunk(p, encrypted=enc, hashed_passphrase=HASHED_PASSPHRASE)
+            for p in split_pieces_rabin_karp(note.content)
+        ]
         if ours != doc["children"]:
             failures.append(f"{doc_id} (plugin={len(doc['children'])} ours={len(ours)})")
     assert not failures, f"{len(failures)} notes did not reproduce: {failures[:5]}"

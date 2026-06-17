@@ -23,7 +23,14 @@ from ..errors import (
     NoteWriteError,
 )
 from . import encryption
-from .chunks import hash_chunk, split_content, split_pieces_rabin_karp
+from .chunks import (
+    hash_chunk,
+    split_content,
+    split_pieces_rabin_karp,
+)
+from .chunks import (
+    hashed_passphrase as compute_hashed_passphrase,
+)
 from .paths import path_to_id
 
 WRITE_RETRY_LIMIT = 3
@@ -130,6 +137,8 @@ class NoteRepository:
         self._couch = couch
         self._passphrase = passphrase
         self._pbkdf2_salt = pbkdf2_salt
+        # Per-vault salt mixed into encrypted chunk IDs (None when E2EE is off).
+        self._hashed_passphrase = compute_hashed_passphrase(passphrase) if passphrase else None
         self._obfuscate = obfuscate_paths
         self._case_sensitive = case_sensitive
         if chunk_splitter not in ("v2", "v3"):
@@ -289,7 +298,9 @@ class NoteRepository:
                 payload = encryption.encrypt_hkdf(
                     payload, self._passphrase or "", self._pbkdf2_salt
                 )
-                chunk_id = hash_chunk(piece, encrypted=True)
+                chunk_id = hash_chunk(
+                    piece, encrypted=True, hashed_passphrase=self._hashed_passphrase
+                )
             else:
                 chunk_id = hash_chunk(piece)
             children.append(chunk_id)

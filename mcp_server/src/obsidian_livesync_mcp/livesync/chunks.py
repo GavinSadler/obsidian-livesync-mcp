@@ -189,16 +189,102 @@ def split_content(
     return result
 
 
-def _js_to_int32(x: int) -> int:
-    """Mirror JavaScript ``x | 0`` (ToInt32)."""
-    x &= 0xFFFFFFFF
-    return x - 0x100000000 if x >= 0x80000000 else x
+def _js_to_int32(x: float) -> int:
+    """Mirror JavaScript ``x | 0`` (ToInt32).
+
+    Accepts floats so it can model JS bitwise ops applied to the (integer-valued)
+    results of float multiplication; ``int(x)`` truncates toward zero like
+    ToInteger before the modulo, matching the JS engine.
+    """
+    xi = int(x) & 0xFFFFFFFF
+    return xi - 0x100000000 if xi >= 0x80000000 else xi
+
+
+def _js_to_uint32(x: float) -> int:
+    """Mirror JavaScript ``x >>> 0`` (ToUint32)."""
+    return int(x) & 0xFFFFFFFF
 
 
 def _js_imul(a: int, b: int) -> int:
     """Mirror JavaScript ``Math.imul`` (32-bit signed integer multiply)."""
     r = ((a & 0xFFFFFFFF) * (b & 0xFFFFFFFF)) & 0xFFFFFFFF
     return r - 0x100000000 if r >= 0x80000000 else r
+
+
+# --- Per-vault "hashed passphrase" for encrypted chunk IDs ----------------
+#
+# When E2EE is enabled, the plugin salts every chunk ID with a value derived
+# from the passphrase so identical content yields different IDs per vault (a
+# defense against confirmation attacks). The derivation is octagonal-wheels'
+# ``fallbackMixedHashEach`` (MurmurHash3 + FNV-1a, pure JS), seeded with a fixed
+# SALT and the first 75% of the passphrase. Verified bit-for-bit against a real
+# encrypted vault export and the upstream unit-test vectors.
+#
+# Sources:
+#   octagonal-wheels/src/hash/purejs.ts  (mixedHash, fallbackMixedHashEach)
+#   livesync-commonlib  HashManagerCore.ts / XXHash64HashManager
+SALT_OF_ID = "a83hrf7f\x03y7sa8g31"
+_MURMUR_C1 = 0xCC9E2D51
+_MURMUR_C2 = 0x1B873593
+_MURMUR_R1 = 15
+_MURMUR_R2 = 13
+_MURMUR_M = 5
+_MURMUR_N = 0xE6546B64
+_FNV1A_PRIME = 0x01000193
+_FNV1A_EPOCH = 2166136261  # 0x811c9dc5
+
+
+def _rotl32(value: float, rot: int) -> int:
+    """JS ``(v << rot) | (v >>> (32 - rot))`` where ``v`` may be a float."""
+    left = (_js_to_int32(value) << rot) & 0xFFFFFFFF
+    right = _js_to_uint32(value) >> (32 - rot)
+    return _js_to_int32(left | right)
+
+
+def _mixed_hash(text: str, murmur_seed: int, fnv_seed: int) -> tuple[int, int]:
+    """Port of octagonal-wheels ``mixedHash`` → ``[murmur3, fnv1a]`` (uint32s).
+
+    The MurmurHash3 leg uses plain JS float multiplication (not ``Math.imul``),
+    so it intentionally loses precision above 2**53; we mirror that with Python
+    floats so results match the plugin exactly.
+    """
+    h1: float = murmur_seed
+    fnv = fnv_seed & 0xFFFFFFFF
+    length = len(text)
+    for ch in text:
+        k1 = ord(ch)
+        # FNV-1a (exact 32-bit via Math.imul)
+        fnv = _js_to_uint32(_js_imul(_js_to_int32(fnv) ^ k1, _FNV1A_PRIME))
+        # MurmurHash3 (lossy float multiply, matching the JS source)
+        km = float(k1) * float(_MURMUR_C1)
+        km = _rotl32(km, _MURMUR_R1)
+        km = float(km) * float(_MURMUR_C2)
+        h1 = _js_to_int32(h1) ^ _js_to_int32(km)
+        h1 = _rotl32(h1, _MURMUR_R2)
+        h1 = float(h1) * float(_MURMUR_M) + float(_MURMUR_N)
+    mh = _js_to_int32(h1) ^ length
+    mh ^= _js_to_uint32(mh) >> 16
+    mh = _js_imul(mh, 0x85EBCA6B)
+    mh ^= _js_to_uint32(mh) >> 13
+    mh = _js_imul(mh, 0xC2B2AE35)
+    mh ^= _js_to_uint32(mh) >> 16
+    return _js_to_uint32(mh), fnv & 0xFFFFFFFF
+
+
+def _fallback_mixed_hash_each(src: str) -> str:
+    murmur, fnv = _mixed_hash(f"{len(src)}{src}", 1, _FNV1A_EPOCH)
+    return _to_base36(murmur) + _to_base36(fnv)
+
+
+def hashed_passphrase(passphrase: str) -> str:
+    """Derive the per-vault salt mixed into encrypted chunk IDs.
+
+    Mirrors HashManagerCore: ``usingLetters = ~~((len/4)*3)`` characters of the
+    passphrase are prefixed with ``SALT_OF_ID`` and run through
+    ``fallbackMixedHashEach``.
+    """
+    using_letters = int((len(passphrase) / 4) * 3)
+    return _fallback_mixed_hash_each(SALT_OF_ID + passphrase[:using_letters])
 
 
 # Rabin-Karp (V3 "Fine deduplication") constants, from
@@ -307,22 +393,39 @@ def split_pieces_rabin_karp(
     return pieces
 
 
-def hash_chunk(chunk: str, *, encrypted: bool = False) -> str:
+def hash_chunk(
+    chunk: str,
+    *,
+    encrypted: bool = False,
+    hashed_passphrase: str | None = None,
+) -> str:
     """Return the ``h:`` (or ``h:+``) chunk document ID for a piece of content.
 
-    Matches the plugin's XXHash64 path::
+    Matches the plugin's XXHash64 path. For a plain vault::
 
         xxhash.h64(f"{piece}-{piece.length}").toString(36)
 
-    ``piece.length`` in JS is UTF-16 code-unit count; we use the same
-    here so hashes match plugin-written chunks of identical content
-    even when supplementary code points are present.
+    For an encrypted vault the per-vault ``hashedPassphrase`` is mixed in::
+
+        xxhash.h64(f"{piece}-{hashedPassphrase}-{piece.length}").toString(36)
+
+    ``piece.length`` in JS is UTF-16 code-unit count; we use the same here so
+    hashes match plugin-written chunks even with supplementary code points.
+
+    When ``encrypted`` is True, ``hashed_passphrase`` (from
+    :func:`hashed_passphrase`) is required.
     """
-    payload = f"{chunk}-{_utf16_len(chunk)}".encode()
+    length = _utf16_len(chunk)
+    if encrypted:
+        if hashed_passphrase is None:
+            raise ValueError("encrypted chunk hashing requires hashed_passphrase")
+        payload = f"{chunk}-{hashed_passphrase}-{length}".encode()
+        prefix = PREFIX_ENCRYPTED_CHUNK
+    else:
+        payload = f"{chunk}-{length}".encode()
+        prefix = PREFIX_CHUNK
     digest = xxhash.xxh64(payload).intdigest()
-    hash_str = _to_base36(digest)
-    prefix = PREFIX_ENCRYPTED_CHUNK if encrypted else PREFIX_CHUNK
-    return prefix + hash_str
+    return prefix + _to_base36(digest)
 
 
 def assemble_chunks(chunk_data: list[str]) -> str:
