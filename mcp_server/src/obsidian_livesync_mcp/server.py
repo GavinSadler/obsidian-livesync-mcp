@@ -392,8 +392,10 @@ async def _changes_subscriber(
                 if doc.get("type") not in ("plain", "newnote"):
                     graph.seq = seq
                     continue
-                path = doc.get("path")
-                if not isinstance(path, str) or not path:
+                # Resolve the real path; for obfuscated + Property-Encrypted
+                # vaults this decrypts the metadata blob in the `path` field.
+                path = repo.effective_path(doc)
+                if not path:
                     graph.seq = seq
                     continue
                 if doc.get("deleted") is True or doc.get("_deleted") is True:

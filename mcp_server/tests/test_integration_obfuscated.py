@@ -16,19 +16,22 @@ Important structural note discovered from the real export: with Property
 Encryption on, each note doc's top-level fields are zeroed (``children: []``,
 ``mtime: 0`` …) and the real metadata — including the real ``path`` and the
 chunk ``children`` — is an **encrypted JSON blob stored in the ``path`` field**
-(prefixed with ``/\\:`` then an HKDF ``%=`` ciphertext). These tests decrypt
-that blob directly. Wiring Property-Encryption awareness into ``NoteRepository``
-(so ``read()``/``list_paths()`` work transparently) is tracked separately; see
-``test_repository_read_property_encryption_pending``.
+(prefixed with ``/\\:`` then an HKDF ``%=`` ciphertext). The lower-level tests
+decrypt that blob directly to validate the algorithms; the
+``test_repository_*`` tests then exercise the real ``NoteRepository``, which
+now auto-detects and decrypts that blob so ``read()``/``list_paths()`` work
+transparently against a fully obfuscated + Property-Encrypted vault.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from obsidian_livesync_mcp.couchdb import CouchDBClient
+from obsidian_livesync_mcp.errors import EncryptedVaultError
 from obsidian_livesync_mcp.livesync import encryption
 from obsidian_livesync_mcp.livesync.chunks import (
     hash_chunk,
@@ -37,7 +40,7 @@ from obsidian_livesync_mcp.livesync.chunks import (
 )
 from obsidian_livesync_mcp.livesync.links import LinkGraph
 from obsidian_livesync_mcp.livesync.models import extract_frontmatter
-from obsidian_livesync_mcp.livesync.notes import _decode_chunk_payload
+from obsidian_livesync_mcp.livesync.notes import NoteRepository, _decode_chunk_payload
 from obsidian_livesync_mcp.livesync.paths import path_to_id
 
 from .fixture_loader import LoadedVault, load_vault
@@ -276,28 +279,78 @@ def test_link_graph_builds_from_obfuscated_vault(vault: LoadedVault) -> None:
 
 
 # --------------------------------------------------------------------------
-# Pending: NoteRepository transparent read of Property-Encrypted vaults
+# NoteRepository transparent read/list of Property-Encrypted vaults
+#
+# These exercise the real repository end-to-end: it must auto-detect the
+# Property-Encryption metadata blob, decrypt it, and expose real paths and
+# reassembled content just like a plain vault.
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="NoteRepository does not yet decode the Property-Encryption metadata "
-    "blob; obfuscated reads return empty until that support lands.",
-    strict=True,
-)
-async def test_repository_read_property_encryption_pending(vault: LoadedVault) -> None:
-    from typing import cast
-
-    from obsidian_livesync_mcp.couchdb import CouchDBClient
-    from obsidian_livesync_mcp.livesync.notes import NoteRepository
-
-    repo = NoteRepository(
+@pytest.fixture
+def repo(vault: LoadedVault) -> NoteRepository:
+    assert vault.salt is not None, "obfuscated vault must have PBKDF2 salt"
+    return NoteRepository(
         cast(CouchDBClient, vault.couch),
         passphrase=PASSPHRASE,
         pbkdf2_salt=vault.salt,
         obfuscate_paths=True,
         case_sensitive=False,
     )
+
+
+async def test_repository_reads_property_encrypted_readme(repo: NoteRepository) -> None:
+    """``read`` resolves the real path, decrypts metadata + chunks transparently."""
     note = await repo.read("README.md")
     assert note is not None
+    assert note.path == "README.md"
     assert "Fixture Vault Documentation" in note.content
+    assert note.mtime > 0  # real mtime came from the decrypted metadata blob
+    assert note.size > 0
+
+
+async def test_repository_reads_property_encrypted_subfolder_note(repo: NoteRepository) -> None:
+    """A note in a subfolder (path inside the encrypted blob) reads back."""
+    note = await repo.read("Guides/Link notes.md")
+    assert note is not None
+    assert note.path == "Guides/Link notes.md"
+    assert note.content  # non-empty: children were decrypted from the blob
+
+
+async def test_repository_read_is_case_insensitive_property_encrypted(
+    repo: NoteRepository,
+) -> None:
+    for variant in ("README.md", "readme.md", "ReadMe.MD"):
+        note = await repo.read(variant)
+        assert note is not None, f"{variant!r} failed to resolve"
+        assert note.path == "README.md"
+
+
+async def test_repository_list_paths_decrypts_metadata(
+    repo: NoteRepository, vault: LoadedVault
+) -> None:
+    """``list_paths`` surfaces real decrypted paths, not the encrypted blobs."""
+    assert vault.salt is not None
+    listed = await repo.list_paths()
+    paths = {item["path"] for item in listed}
+    # No encrypted-blob or obfuscated-id leakage into the listing.
+    assert not any(p.startswith(("/\\:", "f:")) for p in paths)
+    assert "%=" not in "".join(paths)
+    # Every live obfuscated note's real (decrypted) path is present.
+    expected = {_decrypt_metadata(doc, vault.salt)["path"] for doc in _live_obfuscated_docs(vault)}
+    assert expected <= paths, f"missing {expected - paths}"
+    # Metadata really was decrypted: mtimes are populated, not zeroed.
+    assert any(item["mtime"] > 0 for item in listed)
+
+
+async def test_repository_missing_salt_raises_on_property_encrypted(vault: LoadedVault) -> None:
+    """Without the salt, a Property-Encrypted read fails loudly (not silently empty)."""
+    repo = NoteRepository(
+        cast(CouchDBClient, vault.couch),
+        passphrase=PASSPHRASE,
+        pbkdf2_salt=None,  # salt not loaded
+        obfuscate_paths=True,
+        case_sensitive=False,
+    )
+    with pytest.raises(EncryptedVaultError):
+        await repo.read("README.md")

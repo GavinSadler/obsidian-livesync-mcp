@@ -1272,24 +1272,38 @@ The same `_changes` feed will eventually feed the vector indexer
 Tracked here so we don't lose them. These all need resolution before we
 can claim full round-trip compatibility with the LiveSync plugin.
 
+### Resolved via real-vault integration testing
+
+Read-side compatibility has now been validated byte-for-byte against
+real plugin exports in three configurations — plain, E2EE, and E2EE +
+Path Obfuscation + Property Encryption (see
+`tests/test_integration_{plain,encrypted,obfuscated}.py`):
+
+- **Encryption: V2 HKDF — verified against real vaults.** Every encrypted
+  chunk in the real E2EE and obfuscated exports decrypts with our PBKDF2
+  salt + HKDF derivation, and re-hashes to the plugin's exact `h:+` chunk
+  ID. Encrypted chunk IDs mix in a per-vault `hashedPassphrase`
+  (octagonal-wheels `fallbackMixedHashEach`: MurmurHash3 + FNV-1a):
+  `xxhash64(plaintext + "-" + hashedPassphrase + "-" + utf16_len)`.
+- **Path obfuscation hashing — resolved.** The `path.ts` "stretching" loop
+  is an upstream no-op (it re-hashes the *original* buffer each iteration),
+  so the obfuscated ID collapses to a single SHA-256:
+  `f: + sha256(sha256(passphrase) + ":" + lower(path))`. Verified against
+  all 38 `f:` IDs in the real obfuscated export.
+- **Property Encryption — supported.** With obfuscation on, the plugin
+  zeroes the top-level note fields and stores real `{path, mtime, ctime,
+  size, children}` as an HKDF blob in the `path` field (marker `/\:` +
+  `%=`). `NoteRepository` auto-detects and decrypts this, so `read()` /
+  `list_paths()` work transparently. Uses the same passphrase/salt as
+  content E2EE — no extra config knob.
+
 ### Hard limitations of the MVP
 
-- **Encryption: V2 HKDF only.** The current LiveSync format (`%=`) is
-  implemented end-to-end via the `cryptography` library, with spec
-  mirrored from `octagonal-wheels/src/encryption/hkdf.ts`. Ephemeral
-  salt (`%$`) is decoded for reads. Legacy `%` (PBKDF2) and `%~` (V3)
-  chunks raise `EncryptionNotSupportedError`. The implementation is
-  spec-correct under unit testing but **has not been validated against
-  a real plugin-encrypted vault yet** — that interop round-trip is the
-  next outstanding compatibility task.
+- **Encryption: V2 HKDF only.** Legacy `%` (PBKDF2) and `%~` (V3) chunks
+  raise `EncryptionNotSupportedError`. Ephemeral salt (`%$`) is decoded
+  for reads only.
 
 ### Unresolved spec questions (need real-vault verification)
-
-- **Path obfuscation stretching loop.** `path.ts` calls SHA-256 in a loop
-  `key.length` times when deriving the obfuscated ID. The exact semantics
-  of `key.length` (is `key` the passphrase string? a derived byte array?)
-  aren't clear from the TS alone — verify with a known-input known-output
-  pair from a real obfuscated vault before claiming compatibility.
 
 - **Compression marker.** Two markers appear in the TS source: `~`
   (referenced widely in older code) and `\u{000E}LZ\u{001D}`
@@ -1298,13 +1312,12 @@ can claim full round-trip compatibility with the LiveSync plugin.
   paths — is not obvious. Our writes should match whichever marker the
   plugin currently produces for new chunks. Verify with a real vault.
 
-- **HKDF parameters — implemented but unverified against a real vault.**
-  Parameters traced from `octagonal-wheels/src/encryption/hkdf.ts`:
-  PBKDF2-HMAC-SHA256 (310 000 iter, 32-byte salt), HKDF-SHA256 with empty
-  `info` and 32-byte salt, AES-GCM-256 with 12-byte IV and appended
-  16-byte tag, layout `iv[12] || hkdf_salt[32] || ct+tag`. Round-trips
-  in unit tests, but cross-implementation interop (Python ↔ plugin)
-  still wants a live test.
+- **HKDF parameters — verified against a real vault.** Parameters traced
+  from `octagonal-wheels/src/encryption/hkdf.ts`: PBKDF2-HMAC-SHA256
+  (310 000 iter, 32-byte salt), HKDF-SHA256 with empty `info` and 32-byte
+  salt, AES-GCM-256 with 12-byte IV and appended 16-byte tag, layout
+  `iv[12] || hkdf_salt[32] || ct+tag`. Confirmed by decrypting every chunk
+  in the real E2EE and obfuscated exports (Python ↔ plugin interop).
 
 - **Hash algorithm selection.** The plugin supports XXHash64 (default),
   SHA1, and a pure-JS mixed hash. We implement XXHash64 only. If a user
@@ -1319,11 +1332,14 @@ can claim full round-trip compatibility with the LiveSync plugin.
 
 ### Verification deferred
 
-- **No integration tests against a real vault.** All tests are unit
-  tests against the spec as we understand it from the TS source. Before
-  declaring this server "compatible," set up a local Docker CouchDB +
-  an Obsidian instance with LiveSync, do round-trip writes from both
-  sides, and verify the plugin can read what we wrote and vice versa.
+- **Write-side round-trip against a live plugin.** Read-side integration
+  tests now run the real `NoteRepository` against actual plugin exports
+  (plain / E2EE / obfuscated+Property-Encryption) and verify our re-split
+  of decrypted content reproduces the plugin's chunk IDs exactly — strong
+  evidence our *writes* will dedup correctly. Still outstanding: a live
+  round-trip where the plugin reads back notes this server *wrote* to a
+  shared CouchDB (especially encrypted/obfuscated writes and the `eden`
+  field shape).
 
 ## Open questions
 

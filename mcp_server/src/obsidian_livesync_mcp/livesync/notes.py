@@ -7,6 +7,7 @@ and the inverse for writes.
 from __future__ import annotations
 
 import base64
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -37,6 +38,15 @@ WRITE_RETRY_LIMIT = 3
 MAX_READ_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB safety net
 
 SYNC_PARAMETERS_DOC_ID = "_local/obsidian_livesync_sync_parameters"
+
+# When Path Obfuscation is enabled the plugin can no longer keep the real path
+# in the (now hashed) document ID, so it stores the note's metadata — real
+# ``path``, ``mtime``, ``ctime``, ``size`` and the chunk ``children`` list — as
+# an encrypted JSON blob in the ``path`` field, prefixed with this marker and
+# followed by an HKDF (``%=``) ciphertext. The top-level fields are zeroed. We
+# call this "Property Encryption"; it rides along with obfuscation and uses the
+# same passphrase/salt as content E2EE.
+PROPERTY_ENC_PATH_PREFIX = "/\\:"
 
 
 async def fetch_pbkdf2_salt(couch: CouchDBClient) -> bytes | None:
@@ -159,6 +169,60 @@ class NoteRepository:
             case_sensitive=self._case_sensitive,
         )
 
+    @staticmethod
+    def _is_property_encrypted(doc: dict[str, Any]) -> bool:
+        """True if a note doc's metadata (path/children/…) is an encrypted blob.
+
+        Detected by the ``/\\:`` marker plus an embedded HKDF (``%=``) ciphertext
+        in the ``path`` field. See :data:`PROPERTY_ENC_PATH_PREFIX`.
+        """
+        path = doc.get("path")
+        return isinstance(path, str) and path.startswith(PROPERTY_ENC_PATH_PREFIX) and "%=" in path
+
+    def _decrypt_metadata(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """Decrypt a Property-Encrypted note doc's metadata blob into a dict.
+
+        Returns the decrypted ``{path, mtime, ctime, size, children}`` mapping.
+        Requires a configured passphrase and the vault PBKDF2 salt.
+        """
+        raw = str(doc["path"])
+        marker = raw.index("%=")
+        decoded = encryption.decrypt(raw[marker:], self._passphrase or "", self._pbkdf2_salt)
+        meta: dict[str, Any] = json.loads(decoded)
+        return meta
+
+    def _effective_doc(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """Return a note doc with Property-Encrypted metadata resolved.
+
+        For an ordinary (plain or content-only-E2EE) doc this is a no-op. For a
+        Property-Encrypted doc it overlays the decrypted real ``path``,
+        ``mtime``, ``ctime``, ``size`` and ``children`` onto the zeroed
+        top-level fields so the rest of the repository can treat it uniformly.
+        """
+        if not self._is_property_encrypted(doc):
+            return doc
+        if not self._passphrase or self._pbkdf2_salt is None:
+            raise EncryptedVaultError(
+                "note metadata is Property-Encrypted (path obfuscation + E2EE) but no "
+                "passphrase/salt is loaded; set LIVESYNC_PASSPHRASE and ensure the "
+                "sync-parameters doc is reachable"
+            )
+        return {**doc, **self._decrypt_metadata(doc)}
+
+    def effective_path(self, doc: dict[str, Any]) -> str | None:
+        """Real note path for a raw doc (decrypting metadata if needed).
+
+        Used by the _changes subscriber, where docs arrive straight off the
+        feed and may carry Property-Encrypted metadata. Returns ``None`` if the
+        doc has no usable path or the blob can't be decrypted.
+        """
+        try:
+            resolved = self._effective_doc(doc)
+        except (EncryptedVaultError, ValueError, KeyError):
+            return None
+        path = resolved.get("path")
+        return path if isinstance(path, str) and path else None
+
     def set_pbkdf2_salt(self, salt: bytes) -> None:
         """Inject the vault PBKDF2 salt fetched at startup."""
         self._pbkdf2_salt = salt
@@ -207,6 +271,9 @@ class NoteRepository:
             doc_type = doc.get("type")
             if doc_type not in ("plain", "newnote"):
                 continue
+            # Resolve Property-Encrypted metadata so the real path/mtime/size
+            # surface instead of the encrypted blob and zeroed fields.
+            doc = self._effective_doc(doc)
             path = doc.get("path", doc_id)
             if path_prefix and not path.startswith(path_prefix):
                 continue
@@ -231,7 +298,9 @@ class NoteRepository:
             return None
         if doc.get("deleted") is True:
             return None
-        return doc
+        # Resolve Property-Encrypted metadata (real path/children/mtime) so the
+        # caller sees a uniform doc regardless of obfuscation.
+        return self._effective_doc(doc)
 
     async def _assemble_content(self, note_doc: dict[str, Any]) -> str:
         """Fetch and assemble chunks for a note doc into plaintext."""
