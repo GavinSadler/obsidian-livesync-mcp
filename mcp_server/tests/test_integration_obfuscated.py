@@ -37,6 +37,16 @@ try:
 except FileNotFoundError as exc:  # pragma: no cover - depends on checkout
     pytest.skip(f"obfuscated vault fixture missing: {exc}", allow_module_level=True)
 
+# Guard: this suite validates *path obfuscation*. If the export was taken before
+# obfuscation was applied (no `f:` document IDs), skip with a clear reason. Flips
+# on automatically once a genuinely obfuscated export is supplied.
+if not any(doc_id.startswith("f:") for doc_id in _VAULT.raw_docs):  # pragma: no cover
+    pytest.skip(
+        "obfuscated fixture has no f: document IDs — not actually obfuscated; "
+        "re-export with Path Obfuscation enabled",
+        allow_module_level=True,
+    )
+
 
 @pytest.fixture
 def vault() -> LoadedVault:
@@ -72,6 +82,34 @@ def _live_note_ids(vault: LoadedVault) -> list[str]:
             continue
         out.append(doc_id)
     return out
+
+
+def _chunk_is_encrypted(chunk_id: str) -> bool:
+    """A chunk's ID prefix tells us how it was hashed: `h:+` encrypted, `h:` plain.
+
+    A real rebuilt vault can retain plaintext *orphan* chunks alongside the new
+    encrypted ones, so tests must hash each chunk according to its own marker
+    rather than assuming the whole vault is encrypted.
+    """
+    return chunk_id.startswith("h:+")
+
+
+def _children_encrypted(doc: dict[str, object]) -> bool:
+    """Whether a note's chunks are encrypted, inferred from its first child ID."""
+    children = doc.get("children")
+    if not isinstance(children, list) or not children:
+        return False
+    first = children[0]
+    return isinstance(first, str) and first.startswith("h:+")
+
+
+def _find_doc_by_path(vault: LoadedVault, real_path: str) -> dict[str, object]:
+    """Locate a live note doc by its real-case `path` field (IDs may be obfuscated)."""
+    for doc_id in _live_note_ids(vault):
+        doc = vault.raw_docs[doc_id]
+        if doc.get("path") == real_path:
+            return doc
+    raise KeyError(f"no live note with path {real_path!r}")
 
 
 # --------------------------------------------------------------------------
@@ -153,7 +191,11 @@ def test_chunk_payload_decrypts_in_obfuscated_vault(vault: LoadedVault) -> None:
 
 
 def test_obfuscated_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> None:
-    """hash_chunk(decrypt(data)) must match plugin chunk IDs in obfuscated mode."""
+    """hash_chunk(decode(data)) must match plugin chunk IDs in obfuscated mode.
+
+    Each chunk is hashed per its own `h:`/`h:+` marker so plaintext orphan
+    chunks left over from a rebuild don't cause false failures.
+    """
     assert vault.salt is not None
     mismatches = []
     for doc_id, doc in vault.raw_docs.items():
@@ -161,7 +203,7 @@ def test_obfuscated_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> No
             continue
         try:
             raw = _decode_chunk_payload(doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
-            if hash_chunk(raw, encrypted=True) != doc_id:
+            if hash_chunk(raw, encrypted=_chunk_is_encrypted(doc_id)) != doc_id:
                 mismatches.append(doc_id)
         except Exception:
             mismatches.append(doc_id)
@@ -211,10 +253,11 @@ async def test_v3_splitter_reproduces_obfuscated_note_children(
     repo: NoteRepository, vault: LoadedVault
 ) -> None:
     """V3 splitter must reproduce plugin's children in obfuscated mode."""
-    doc = vault.raw_docs["readme.md"]
+    doc = _find_doc_by_path(vault, "README.md")
     note = await repo.read("readme.md")
     assert note is not None
-    our_children = [hash_chunk(p, encrypted=True) for p in split_pieces_rabin_karp(note.content)]
+    enc = _children_encrypted(doc)
+    our_children = [hash_chunk(p, encrypted=enc) for p in split_pieces_rabin_karp(note.content)]
     assert our_children == doc["children"]
 
 
@@ -233,7 +276,8 @@ async def test_v3_splitter_reproduces_obfuscated_every_note(
             continue
         note = await repo.read(path)
         assert note is not None
-        ours = [hash_chunk(p, encrypted=True) for p in split_pieces_rabin_karp(note.content)]
+        enc = _children_encrypted(doc)
+        ours = [hash_chunk(p, encrypted=enc) for p in split_pieces_rabin_karp(note.content)]
         if ours != doc["children"]:
             failures.append(f"{path} (plugin={len(doc['children'])} ours={len(ours)})")
     assert not failures, f"{len(failures)} notes did not reproduce: {failures[:5]}"
