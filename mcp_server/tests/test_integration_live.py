@@ -24,6 +24,7 @@ recreated each run), so they never touch a real vault.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ import httpx
 import pytest
 
 from obsidian_livesync_mcp.couchdb import CouchDBClient
+from obsidian_livesync_mcp.livesync import encryption
 from obsidian_livesync_mcp.livesync.chunks import hash_chunk, split_pieces_rabin_karp
 from obsidian_livesync_mcp.livesync.notes import NoteRepository, fetch_pbkdf2_salt
 from scripts.load_fixture import load_fixture_into_couch
@@ -134,20 +136,14 @@ async def test_live_list_paths_surfaces_real_notes(live_vault: LiveVault) -> Non
 
 
 # --------------------------------------------------------------------------
-# Writes (plain + encrypted) — exercises put / bulk_docs and the write path
+# Writes (all vaults) — exercises put / bulk_docs and the write path
 #
-# Writing into an obfuscated + Property-Encrypted vault is intentionally out of
-# scope: our write path doesn't re-encrypt the metadata blob, so we skip it.
+# plain / encrypted store metadata in plaintext top-level fields; obfuscated
+# stores it in the encrypted `/\:%=` `path` blob (Property Encryption).
 # --------------------------------------------------------------------------
 
 
-def _writable(vault: LiveVault) -> bool:
-    return vault.name in ("plain", "encrypted")
-
-
 async def test_live_write_read_update_delete_roundtrip(live_vault: LiveVault) -> None:
-    if not _writable(live_vault):
-        pytest.skip(f"writes not supported for {live_vault.name} vault")
     repo = live_vault.repo
     path = "live-roundtrip.md"
 
@@ -170,10 +166,11 @@ async def test_live_write_reproduces_plugin_chunk_ids(live_vault: LiveVault) -> 
 
     This is the write-side compatibility signal: re-splitting + hashing the
     content yields the same ``children`` the plugin stored, so our writes dedup
-    against existing chunks instead of forking the vault.
+    against existing chunks instead of forking the vault. (plain/encrypted only:
+    obfuscated keeps children inside the encrypted blob — see the next test.)
     """
-    if not _writable(live_vault):
-        pytest.skip(f"writes not supported for {live_vault.name} vault")
+    if live_vault.name == "obfuscated":
+        pytest.skip("obfuscated stores children in the encrypted metadata blob")
     repo = live_vault.repo
 
     source = await repo.read(README_PATH)
@@ -194,3 +191,36 @@ async def test_live_write_reproduces_plugin_chunk_ids(live_vault: LiveVault) -> 
         for p in split_pieces_rabin_karp(source.content)
     ]
     assert written["children"] == expected
+
+
+async def test_live_obfuscated_write_produces_property_encrypted_doc(
+    live_vault: LiveVault,
+) -> None:
+    """obfuscated: a write produces the f: id + encrypted metadata blob shape the
+    plugin uses, and the blob decrypts to metadata whose chunk IDs reproduce."""
+    if live_vault.name != "obfuscated":
+        pytest.skip("Property-Encryption write shape only applies to obfuscated vaults")
+    repo = live_vault.repo
+    content = "# Obfuscated Write\n\n中文 🚀 — encrypted-metadata round trip.\n"
+
+    await repo.create("live-obf-write.md", content)
+    raw = await live_vault.client.get(repo._path_to_id("live-obf-write.md"))
+    assert raw is not None
+    # Plugin on-disk shape: encrypted blob in `path`, zeroed top-level fields.
+    assert raw["path"].startswith("/\\:") and "%=" in raw["path"]
+    assert raw["children"] == [] and raw["mtime"] == 0 and raw["size"] == 0
+
+    salt = await fetch_pbkdf2_salt(live_vault.client)
+    assert salt is not None
+    blob = raw["path"]
+    meta = json.loads(encryption.decrypt(blob[blob.index("%=") :], PASSPHRASE, salt))
+    assert meta["path"] == "live-obf-write.md"
+    assert meta["size"] == len(content.encode("utf-8"))
+    assert meta["children"] == [
+        hash_chunk(p, encrypted=True, hashed_passphrase=repo._hashed_passphrase)
+        for p in split_pieces_rabin_karp(content)
+    ]
+
+    # And it reads back transparently through the repository.
+    back = await repo.read("live-obf-write.md")
+    assert back is not None and back.content == content

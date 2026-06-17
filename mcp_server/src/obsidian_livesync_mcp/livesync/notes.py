@@ -379,6 +379,37 @@ class NoteRepository:
             docs.append({"_id": chunk_id, "data": payload, "type": "leaf"})
         return children, docs
 
+    def _build_metadata_blob(
+        self, *, path: str, mtime: int, ctime: int, size: int, children: list[str]
+    ) -> str:
+        """Encrypt note metadata into the Property-Encryption ``path`` blob.
+
+        Mirrors what the plugin stores for obfuscated vaults: the ``/\\:`` marker
+        followed by an HKDF (``%=``) ciphertext of the
+        ``{path, mtime, ctime, size, children}`` JSON. The caller zeroes the
+        top-level fields. The ciphertext is non-deterministic (random IV/salt),
+        which is fine — the plugin re-derives everything on read; what must match
+        is the obfuscated ``_id`` and the content-addressed chunk IDs.
+        """
+        if not self._passphrase or self._pbkdf2_salt is None:
+            raise EncryptedVaultError(
+                "obfuscated (Property-Encrypted) writes require a passphrase and the "
+                "vault PBKDF2 salt"
+            )
+        meta = {
+            "path": path,
+            "mtime": mtime,
+            "ctime": ctime,
+            "size": size,
+            "children": list(children),
+        }
+        blob = encryption.encrypt_hkdf(
+            json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+            self._passphrase,
+            self._pbkdf2_salt,
+        )
+        return PROPERTY_ENC_PATH_PREFIX + blob
+
     async def _write_note(
         self,
         path: str,
@@ -395,16 +426,32 @@ class NoteRepository:
 
         last_existing = existing
         for attempt in range(WRITE_RETRY_LIMIT):
-            parent: dict[str, Any] = {
-                "_id": doc_id,
-                "path": path,
-                "type": "plain",
-                "ctime": ctime,
-                "mtime": mtime,
-                "size": size,
-                "children": list(children),
-                "eden": {},
-            }
+            if self._obfuscate:
+                # Property Encryption: real metadata lives in the encrypted
+                # `path` blob; the top-level fields are zeroed.
+                parent: dict[str, Any] = {
+                    "_id": doc_id,
+                    "path": self._build_metadata_blob(
+                        path=path, mtime=mtime, ctime=ctime, size=size, children=children
+                    ),
+                    "type": "plain",
+                    "ctime": 0,
+                    "mtime": 0,
+                    "size": 0,
+                    "children": [],
+                    "eden": {},
+                }
+            else:
+                parent = {
+                    "_id": doc_id,
+                    "path": path,
+                    "type": "plain",
+                    "ctime": ctime,
+                    "mtime": mtime,
+                    "size": size,
+                    "children": list(children),
+                    "eden": {},
+                }
             if last_existing is not None and last_existing.get("_rev"):
                 parent["_rev"] = last_existing["_rev"]
 

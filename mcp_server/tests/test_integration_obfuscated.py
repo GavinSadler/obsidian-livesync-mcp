@@ -354,3 +354,79 @@ async def test_repository_missing_salt_raises_on_property_encrypted(vault: Loade
     )
     with pytest.raises(EncryptedVaultError):
         await repo.read("README.md")
+
+
+# --------------------------------------------------------------------------
+# Writes into a Property-Encrypted vault
+#
+# The write path must reproduce the plugin's on-disk shape: an obfuscated `f:`
+# id, the real metadata as an encrypted `/\\:%=` blob in the `path` field,
+# zeroed top-level fields, and encrypted (`h:+`) content-addressed chunks.
+# --------------------------------------------------------------------------
+
+
+async def test_repository_write_creates_property_encrypted_doc(
+    repo: NoteRepository, vault: LoadedVault
+) -> None:
+    """Creating a note writes the obfuscated id + encrypted metadata blob, and
+    the blob decrypts to metadata whose chunk IDs reproduce exactly."""
+    assert vault.salt is not None
+    content = "# New Note\n\nproperty-encrypted write test with a bit of body text.\n"
+    note = await repo.create("zzz-write-test.md", content)
+    assert note.path == "zzz-write-test.md"
+
+    f_id = path_to_id(
+        "zzz-write-test.md", obfuscate=True, passphrase=PASSPHRASE, case_sensitive=False
+    )
+    raw = await vault.couch.get(f_id)
+    assert raw is not None
+    # On-disk shape matches the plugin: obfuscated id, encrypted blob, zeroed fields.
+    assert raw["_id"] == f_id
+    assert raw["path"].startswith("/\\:") and "%=" in raw["path"]
+    assert raw["children"] == []
+    assert raw["mtime"] == 0 and raw["ctime"] == 0 and raw["size"] == 0
+
+    # The metadata blob decrypts to the real values, and chunk IDs reproduce.
+    meta = _decrypt_metadata(raw, vault.salt)
+    assert meta["path"] == "zzz-write-test.md"
+    assert meta["size"] == len(content.encode("utf-8"))
+    assert meta["children"] == [
+        hash_chunk(p, encrypted=True, hashed_passphrase=HASHED_PASSPHRASE)
+        for p in split_pieces_rabin_karp(content)
+    ]
+    assert _children_encrypted(meta)  # h:+ encrypted chunks
+
+
+async def test_repository_write_read_roundtrip_property_encrypted(repo: NoteRepository) -> None:
+    """A note written into the obfuscated vault reads back through the repo."""
+    content = "# Round Trip\n\n中文 🚀 unicode survives the encrypted-metadata write.\n"
+    await repo.create("round/trip note.md", content)
+    back = await repo.read("round/trip note.md")
+    assert back is not None
+    assert back.path == "round/trip note.md"
+    assert back.content == content
+    assert back.size == len(content.encode("utf-8"))
+
+
+async def test_repository_update_preserves_ctime_property_encrypted(repo: NoteRepository) -> None:
+    """Updating an obfuscated note bumps mtime but preserves the original ctime."""
+    created = await repo.create("update-me.md", "v1\n")
+    assert created.ctime > 0
+    updated = await repo.update("update-me.md", "v2 content\n")
+    assert updated.ctime == created.ctime
+    assert updated.mtime >= created.mtime
+    back = await repo.read("update-me.md")
+    assert back is not None and back.content == "v2 content\n"
+
+
+async def test_repository_write_requires_salt_property_encrypted(vault: LoadedVault) -> None:
+    """Obfuscated writes without the salt fail loudly rather than corrupting."""
+    repo = NoteRepository(
+        cast(CouchDBClient, vault.couch),
+        passphrase=PASSPHRASE,
+        pbkdf2_salt=None,
+        obfuscate_paths=True,
+        case_sensitive=False,
+    )
+    with pytest.raises(EncryptedVaultError):
+        await repo.create("no-salt.md", "body\n")
