@@ -112,8 +112,18 @@ def encrypt_hkdf(plaintext: str, passphrase: str, pbkdf2_salt: bytes) -> str:
     return HKDF_PREFIX + base64.b64encode(blob).decode("ascii")
 
 
-def decrypt_hkdf(ciphertext: str, passphrase: str, pbkdf2_salt: bytes) -> str:
-    """Decrypt the ``%=`` HKDF format."""
+def decrypt_hkdf(
+    ciphertext: str,
+    passphrase: str,
+    pbkdf2_salt: bytes,
+    *,
+    master_key: bytes | None = None,
+) -> str:
+    """Decrypt the ``%=`` HKDF format.
+
+    Pass a pre-derived ``master_key`` to skip the PBKDF2 step when decrypting
+    many chunks for the same vault in a tight loop.
+    """
     if not ciphertext.startswith(HKDF_PREFIX):
         raise ValueError(f"expected ciphertext to start with {HKDF_PREFIX!r}")
     blob = base64.b64decode(ciphertext[len(HKDF_PREFIX) :])
@@ -122,7 +132,7 @@ def decrypt_hkdf(ciphertext: str, passphrase: str, pbkdf2_salt: bytes) -> str:
     iv = blob[:IV_LENGTH]
     hkdf_salt = blob[IV_LENGTH : IV_LENGTH + HKDF_SALT_LENGTH]
     aead = blob[IV_LENGTH + HKDF_SALT_LENGTH :]
-    master = derive_master_key(passphrase, pbkdf2_salt)
+    master = master_key if master_key is not None else derive_master_key(passphrase, pbkdf2_salt)
     chunk_key = derive_chunk_key(master, hkdf_salt)
     plaintext = AESGCM(chunk_key).decrypt(iv, aead, None)
     return plaintext.decode("utf-8")

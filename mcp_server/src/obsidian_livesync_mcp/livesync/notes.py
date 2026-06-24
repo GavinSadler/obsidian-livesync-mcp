@@ -98,12 +98,19 @@ def _now_ms() -> int:
 
 
 def _decode_chunk_payload(
-    payload: str, *, passphrase: str | None, pbkdf2_salt: bytes | None
+    payload: str,
+    *,
+    passphrase: str | None,
+    pbkdf2_salt: bytes | None,
+    master_key: bytes | None = None,
 ) -> str:
     """Decrypt (if needed) then decompress a chunk's ``data`` field.
 
     Order matters: the plugin compresses *before* encrypting, so on read
     we decrypt first and then decompress the resulting cleartext.
+
+    Pass a pre-derived ``master_key`` to skip per-chunk PBKDF2 derivation
+    when decoding many chunks for the same vault.
     """
     if encryption.is_hkdf_encrypted(payload):
         if not passphrase:
@@ -116,7 +123,9 @@ def _decode_chunk_payload(
                     "chunk is HKDF-encrypted but the vault PBKDF2 salt is not loaded; "
                     "check that the sync-parameters doc is reachable"
                 )
-            payload = encryption.decrypt_hkdf(payload, passphrase, pbkdf2_salt)
+            payload = encryption.decrypt_hkdf(
+                payload, passphrase, pbkdf2_salt, master_key=master_key
+            )
         else:
             # %$ ephemeral-salt format — salt travels with the ciphertext
             payload = encryption.decrypt_ephemeral_hkdf(payload, passphrase)

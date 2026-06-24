@@ -16,6 +16,7 @@ from typing import cast
 import pytest
 
 from obsidian_livesync_mcp.couchdb import CouchDBClient
+from obsidian_livesync_mcp.livesync import encryption
 from obsidian_livesync_mcp.livesync.chunks import (
     hash_chunk,
     hashed_passphrase,
@@ -37,6 +38,11 @@ try:
     _VAULT = load_vault(VAULT_NAME)
 except FileNotFoundError as exc:  # pragma: no cover - depends on checkout
     pytest.skip(f"encrypted vault fixture missing: {exc}", allow_module_level=True)
+
+# Derive once so per-chunk decryption tests skip PBKDF2 (310k iters) per chunk.
+_MASTER_KEY: bytes | None = (
+    encryption.derive_master_key(PASSPHRASE, _VAULT.salt) if _VAULT.salt else None
+)
 
 # Guard: this suite validates *encryption*. If the export was taken before E2EE
 # was actually applied (no `h:+` chunks), skip with a clear reason rather than
@@ -143,7 +149,7 @@ def test_chunk_payload_decrypts_with_pbkdf2_salt(vault: LoadedVault) -> None:
             continue
         try:
             decoded = _decode_chunk_payload(
-                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt
+                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt, master_key=_MASTER_KEY
             )
             assert isinstance(decoded, str)
         except Exception as e:
@@ -163,7 +169,9 @@ def test_encrypted_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> Non
         if not doc_id.startswith("h:"):
             continue
         try:
-            raw = _decode_chunk_payload(doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
+            raw = _decode_chunk_payload(
+                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt, master_key=_MASTER_KEY
+            )
             if (
                 hash_chunk(
                     raw, encrypted=_chunk_is_encrypted(doc_id), hashed_passphrase=HASHED_PASSPHRASE

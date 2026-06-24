@@ -56,6 +56,11 @@ try:
 except FileNotFoundError as exc:  # pragma: no cover - depends on checkout
     pytest.skip(f"obfuscated vault fixture missing: {exc}", allow_module_level=True)
 
+# Derive once so per-chunk decryption tests skip PBKDF2 (310k iters) per chunk.
+_MASTER_KEY: bytes | None = (
+    encryption.derive_master_key(PASSPHRASE, _VAULT.salt) if _VAULT.salt else None
+)
+
 # Guard: this suite validates *path obfuscation*. If the export was taken before
 # obfuscation was applied (no `f:` document IDs), skip with a clear reason. Flips
 # on automatically once a genuinely obfuscated export is supplied.
@@ -113,7 +118,9 @@ def _assemble_content(meta: dict[str, Any], vault: LoadedVault) -> str:
     for child_id in meta["children"]:
         chunk = vault.raw_docs[child_id]
         parts.append(
-            _decode_chunk_payload(chunk["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
+            _decode_chunk_payload(
+                chunk["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt, master_key=_MASTER_KEY
+            )
         )
     return "".join(parts)
 
@@ -196,7 +203,7 @@ def test_chunk_payload_decrypts_in_obfuscated_vault(vault: LoadedVault) -> None:
             continue
         try:
             decoded = _decode_chunk_payload(
-                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt
+                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt, master_key=_MASTER_KEY
             )
             assert isinstance(decoded, str)
         except Exception as e:
@@ -212,7 +219,9 @@ def test_obfuscated_chunk_ids_reproduced_by_hash_chunk(vault: LoadedVault) -> No
         if not doc_id.startswith("h:"):
             continue
         try:
-            raw = _decode_chunk_payload(doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt)
+            raw = _decode_chunk_payload(
+                doc["data"], passphrase=PASSPHRASE, pbkdf2_salt=vault.salt, master_key=_MASTER_KEY
+            )
             if (
                 hash_chunk(
                     raw,
