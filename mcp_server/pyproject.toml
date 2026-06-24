@@ -27,6 +27,7 @@ dev = [
     "ruff>=0.5.0",
     "mypy>=1.10.0",
     "types-PyYAML>=6.0.0",
+    "testcontainers>=4.14.2",
 ]
 
 [build-system]
@@ -40,6 +41,12 @@ packages = ["src/obsidian_livesync_mcp"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
+markers = [
+    "live: tests that require a live CouchDB container (via Docker/testcontainers)",
+]
+filterwarnings = [
+    "ignore:The wait_for_logs function.*:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100
