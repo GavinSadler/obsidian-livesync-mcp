@@ -1,0 +1,1371 @@
+# Obsidian LiveSync MCP Server — Design
+
+A Python-based MCP (Model Context Protocol) server that lets an LLM interact
+with an Obsidian vault stored in a CouchDB database managed by the
+[Obsidian LiveSync](https://github.com/vrtmrz/obsidian-livesync) plugin.
+
+The server acts as a standalone client to the same CouchDB the plugin syncs
+against. From the database's perspective, the MCP server is just another
+LiveSync peer — but instead of a user editing notes in Obsidian, an LLM is
+reading and modifying them through MCP tools.
+
+## Goals
+
+- Let an LLM browse, read, search, create, update, and delete notes in an
+  Obsidian vault without going through Obsidian itself.
+- Provide semantic (vector) search over the vault so the LLM can find
+  relevant content quickly, with the index maintained server-side via the
+  CouchDB `_changes` feed.
+- Stay protocol-clean: no Obsidian dependency, no plugin code reused — only
+  the LiveSync data schema is mirrored.
+
+## Non-goals
+
+- Real-time multi-peer conflict resolution. Conflicts will be detected and
+  surfaced, but the server is not a full LiveSync replication node.
+- Two-way Obsidian plugin integration. The server reads/writes the database
+  directly.
+- Hosting/managing the CouchDB instance. The user supplies connection info.
+
+---
+
+## Conflict semantics
+
+CouchDB uses optimistic concurrency: every write must include the current
+`_rev`, and stale writes are rejected with HTTP 409. Our server treats the
+database as a normal MVCC store and **does not implement any merge logic**.
+The existing LiveSync plugin on the user's devices already handles
+resolution.
+
+### What the server does
+
+- **Read-modify-write with retry-on-409.** For every update we GET the
+  doc, mutate it, PUT with the current `_rev`. If we get 409, re-fetch
+  and retry (cap at a small number of retries, e.g. 3).
+- **Set `mtime` correctly.** The auto-merger uses `mtime` to order
+  concurrent inserts and to break ties in JSON merges, so every write
+  stamps `mtime` with the current millisecond timestamp. Preserve
+  `ctime` from the existing doc on updates.
+- **Treat soft-deletes as terminal.** A read of a doc with
+  `deleted: true` returns `None` (note not found). Writes recreate it.
+
+### What the server does *not* do
+
+- **No three-way merging.** Even though we know how LiveSync does it (see
+  reference below), we don't reimplement it. Our writes are atomic from
+  CouchDB's perspective.
+- **No conflict creation by us alone.** A single client doing
+  read-modify-write cannot create a `_conflicts` entry — conflicts only
+  arise from replication. If the LiveSync plugin on a device later
+  syncs a divergent edit of a doc we wrote, CouchDB populates
+  `_conflicts`, and the *plugin's* `ConflictManager.tryAutoMerge` runs
+  on the next replication pass on the user's device.
+- **No interactive resolution.** If auto-merge fails on the device, the
+  user is prompted in Obsidian, exactly as they would be today.
+
+### Reference
+
+- `src/lib/src/managers/ConflictManager.ts` — three-way merge and
+  per-line/per-key collision detection.
+- `src/modules/core/ReplicateResultProcessor.ts` — where conflicts are
+  picked up off the replication stream.
+
+---
+
+## Requirements
+
+This is the running source of truth for what the server should do. Items
+are tagged with status: `[ ]` planned, `[~]` in progress, `[x]` complete.
+
+The MCP surface is **14 tools total** — 8 CRUD/content operations, 5
+search & navigation tools, and 1 history query. Every tool description
+occupies LLM context, so each tool earns its slot by doing something
+materially different. Internal state (indexing progress, encryption,
+chunking, the link graph subscriber, etc.) is deliberately hidden from
+the LLM; it shows up only where it affects results.
+
+### MCP tools — notes (CRUD)
+
+- [x] `list_notes(folder?, limit?)` — list note paths in the vault.
+      Supports prefix filter for folder-style browsing.
+- [x] `read_note(path)` — read full markdown content of a note. Handles
+      chunk reassembly + decompression. YAML frontmatter is parsed into
+      a `frontmatter` field and tags extracted into a `tags` field.
+- [x] `read_notes(paths)` — batch-read multiple notes in one call.
+      Per-path errors are reported in the result rather than raised.
+- [x] `create_note(path, content)` — create a new note. Fails if the path
+      already exists.
+- [x] `update_note(path, content)` — overwrite the content of an existing
+      note. Handles chunking + metadata updates.
+- [x] `append_note(path, content, separator?)` — append to an existing
+      note. Safer than read-then-update for incremental log-style writes.
+- [x] `delete_note(path)` — soft-delete a note (sets `deleted: true`).
+- [x] `move_note(old_path, new_path)` — rename/move a note. Atomic from
+      the caller's perspective; create-then-delete under the hood. Does
+      NOT auto-rewrite wikilinks pointing to old_path.
+
+### MCP tools — search & navigation
+
+- [~] `semantic_search(query, top_k?)` — vector similarity search over
+      indexed note chunks. Response includes an `index_coverage:
+      {indexed, total}` field so the caller can tell "no matches" from
+      "index not yet built". No folder filter in v1.
+      **MVP: stub** — returns empty results with honest coverage stats
+      reflecting no index built. Full implementation needs vector store
+      + embedding backend + `_changes` subscriber.
+- [x] `keyword_search(pattern, case_sensitive?, regex?, path_prefix?, limit?)` —
+      literal-string or regex search over note content. Returns matches
+      with line numbers and snippets. Invalid regex raises a clear error.
+- [x] `get_forward_links(path)` — notes that this note links to (outgoing
+      `[[wikilinks]]`). Backed by an in-memory `LinkGraph` that's
+      backfilled on startup and kept fresh by the `_changes` subscriber.
+- [x] `get_backlinks(path)` — notes that reference this note (incoming
+      `[[wikilinks]]`). Same graph as above.
+- [x] `get_links(path)` — both forward and backlinks in a single call.
+
+### MCP tools — history
+
+- [x] `recent_changes(since_seq?, since?, path_prefix?, include_deleted?,
+      change_types?, limit?)` — recent create/update/delete events from
+      the CouchDB `_changes` feed. Two filter modes:
+      - `since_seq: int` — CouchDB sequence (reliable, resumable polling).
+      - `since: str` — "1h", "30m", "7d" (relative) or ISO 8601 (clock-skew sensitive).
+      Returns a `watermark_seq` that callers store and pass back as
+      `since_seq` on the next poll for incremental updates.
+
+### LiveSync schema support
+
+- [x] CouchDB connection (basic auth + TLS).
+- [x] Path → document ID encoding (plain mode).
+- [x] Path → document ID encoding (obfuscated `f:` mode, SHA-256 stretched).
+      *(Implemented; needs real-vault verification — see Known gaps.)*
+- [x] Chunk reassembly from `children[]` references.
+- [x] Note write path: content splitting (verbatim port of
+      `splitPieces2V2`'s text path, UTF-16-aware so chunks dedup with
+      plugin-written notes), chunk hashing (`h:` IDs via XXHash64 +
+      base36), parent doc with `children[]` and empty `eden` field.
+- [x] Soft-delete via `deleted: true`.
+- [x] Compression / decompression (deflate via stdlib `zlib`, `~` marker).
+- [x] Encryption V2 (HKDF, `%=` marker) — read & write. Implemented via
+      the `cryptography` library; PBKDF2 (310k iter, SHA-256) → HKDF
+      (SHA-256, empty info) → AES-GCM-256, with `iv[12] || hkdf_salt[32]
+      || ct+tag` wire layout. Spec mirrored from
+      `octagonal-wheels/src/encryption/hkdf.ts`. Vault PBKDF2 salt is
+      fetched at startup from `_local/obsidian_livesync_sync_parameters`.
+- [x] Encryption V2 (HKDF) ephemeral-salt `%$` — read only (used by
+      session-scoped payloads).
+- [ ] Encryption V1 (PBKDF2, `%` marker) — *(legacy; not implemented,
+      raises a clear error)*.
+- [ ] Encryption V3 (`%~` marker, SHA-256-only KDF) — *(rare; not
+      implemented, raises a clear error)*.
+
+### Vector index
+
+The index runs continuously in the background and is never directly
+visible to the LLM. The only place its state leaks into the API is the
+`index_coverage` field of `semantic_search` responses.
+
+- [ ] Background subscriber to CouchDB `_changes` feed (`since=<saved>`,
+      `feed=continuous`).
+- [ ] On change: fetch updated note, chunk for embedding, embed, upsert
+      into vector store.
+- [ ] On delete: remove vectors for that note from the store.
+- [ ] Pluggable embedding backend (OpenAI, local sentence-transformers,
+      Ollama, etc.) selected via config.
+- [ ] Pluggable vector store (initial choice TBD — Chroma, Qdrant, sqlite-vec,
+      LanceDB are candidates).
+- [ ] Persistent watermark of last-seen `_changes` sequence so the indexer
+      can resume cleanly across restarts.
+- [ ] Initial backfill on first start (or when index is empty).
+- [ ] Admin CLI command for forced full reindex (operator action, **not**
+      an MCP tool).
+
+### Tooling & dev experience
+
+- [x] uv-managed Python project.
+- [x] pytest + pytest-asyncio test scaffolding.
+- [x] ruff for lint + format.
+- [x] mypy type-checking in CI.
+- [x] GitHub Actions: lint, format, type-check, test on push/PR
+      (path-filtered to `mcp_server/**`).
+- [ ] Docker image for running the server.
+
+---
+
+## API reference
+
+Detailed input/output schemas for each MCP tool. Field descriptions here
+are normative — the MCP SDK translates these Pydantic models into a JSON
+Schema that the LLM sees verbatim, so wording matters.
+
+### Cross-cutting conventions
+
+- **Schema mechanism:** Pydantic models. The MCP Python SDK auto-generates
+  JSON Schema from them.
+- **Timestamps:** ISO 8601 strings, UTC (e.g. `"2026-05-14T10:30:00Z"`).
+  LiveSync stores unix-ms internally; we convert at the boundary.
+- **Errors:** typed exceptions, surfaced as structured MCP tool errors.
+  Common ones:
+  - `NoteNotFoundError` — path doesn't exist or is soft-deleted.
+  - `NoteAlreadyExistsError` — path already exists when it shouldn't.
+  - `InvalidPathError` — path malformed (empty, contains `..`, leading `/`,
+    etc.).
+- **Paths:** plain `str`, forward slashes, case-sensitive, relative to vault
+  root. No leading slash. Must end in `.md` for create operations.
+- **Shared `Note` model:** the return type for `read_note`, `create_note`,
+  `update_note`, `append_note`, and `move_note`.
+
+```python
+class Note(BaseModel):
+    """A note's full content and metadata."""
+
+    path: str = Field(description="Path of the note (echoed from input).")
+    content: str = Field(
+        description=(
+            "Markdown content as UTF-8 text. "
+            "YAML frontmatter (if present) has been stripped into the `frontmatter` field. "
+            "Whitespace and line endings in the body are preserved as stored."
+        ),
+    )
+    frontmatter: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Parsed YAML frontmatter from the top of the note. "
+            "None if the note has no frontmatter or if parsing failed. "
+            "Commonly includes metadata like tags, keywords, created, etc."
+        ),
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tags extracted from frontmatter (tags or keywords fields). "
+            "None if no tags found. Lowercase, deduplicated."
+        ),
+    )
+    ctime: datetime = Field(description="Creation time (ISO 8601, UTC).")
+    mtime: datetime = Field(
+        description="Last modification time (ISO 8601, UTC).",
+    )
+    size_bytes: int = Field(
+        ge=0,
+        description="Plaintext size of the note in bytes (UTF-8).",
+    )
+```
+
+### `list_notes`
+
+Browse notes in the vault, optionally scoped to a folder. Intentionally
+**not paginated** — most folders contain few enough notes to return in
+one call, and the LLM's primary discovery tool for large vaults is
+`semantic_search` anyway. If a folder is genuinely larger than the
+limit, the LLM should narrow its filter or switch to semantic search
+rather than iterate.
+
+```python
+class ListNotesInput(BaseModel):
+    """List notes in the vault, optionally scoped to a folder."""
+
+    folder: str | None = Field(
+        default=None,
+        description=(
+            "Optional folder to list notes from, recursively. "
+            "Examples: 'projects/', 'daily/2026/'. A trailing slash is "
+            "added if missing. Null or empty means list from the vault root. "
+            "Paths are case-sensitive and use forward slashes."
+        ),
+    )
+    limit: int = Field(
+        default=1000,
+        ge=1,
+        le=5000,
+        description=(
+            "Maximum notes to return. Defaults to 1000; cap is 5000. "
+            "If you hit the limit and need more, narrow the folder filter "
+            "or use semantic_search instead of trying to enumerate."
+        ),
+    )
+
+
+class NoteListItem(BaseModel):
+    """A single note's summary for listing."""
+
+    path: str = Field(
+        description=(
+            "File path relative to the vault root. "
+            "Examples: 'README.md', 'daily/2026-05-14.md'."
+        ),
+    )
+    mtime: datetime = Field(
+        description="Last modification time (ISO 8601, UTC).",
+    )
+    size_bytes: int = Field(
+        ge=0,
+        description="Plaintext size of the note in bytes.",
+    )
+
+
+class ListNotesOutput(BaseModel):
+    """Notes matching the filter, ordered lexicographically by path."""
+
+    notes: list[NoteListItem] = Field(
+        description=(
+            "Matching notes, sorted by path (case-sensitive lexicographic). "
+            "May be truncated to `limit` items — check `total` to know."
+        ),
+    )
+    total: int = Field(
+        ge=0,
+        description=(
+            "Total notes matching the folder filter (independent of limit). "
+            "If total > len(notes), the result was truncated. "
+            "Narrow the folder or use semantic_search to find what you need."
+        ),
+    )
+```
+
+**Errors:** none. Empty `notes` array if nothing matches.
+
+```mermaid
+sequenceDiagram
+    participant LLM
+    participant Server as MCP Server
+    participant DB as CouchDB
+
+    LLM->>Server: list_notes(folder="projects/", limit=1000)
+    Server->>DB: _all_docs with key range [folder, folder + "￿")
+    DB-->>Server: all matching docs + total count
+    Server-->>LLM: { notes: [n ≤ limit], total: N }
+
+    alt total ≤ limit
+        Note over LLM: Got everything, done.
+    else total > limit
+        Note over LLM: Truncated. Narrow the folder<br/>or call semantic_search.
+    end
+```
+
+### `read_note`
+
+Fetch a single note's full content. Notes are typically 1-20 KB in
+Obsidian; partial-read parameters are intentionally omitted because the
+edge case (multi-megabyte notes) is rare and would add complexity to
+every call.
+
+```python
+class ReadNoteInput(BaseModel):
+    """Read a single note's full content by path."""
+
+    path: str = Field(
+        description=(
+            "Path to the note relative to the vault root. "
+            "Examples: 'README.md', 'daily/2026-05-14.md'. "
+            "Paths are case-sensitive and use forward slashes."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model.
+
+**Errors:**
+- `NoteNotFoundError` — path doesn't exist or is soft-deleted (the LLM
+  cannot distinguish these cases; both look like "no note here").
+- `InvalidPathError` — path is malformed.
+
+**Safety net (internal):** a runtime cap (e.g. 5 MB) refuses to return
+unreasonably large notes to protect server memory. Not part of the
+public API; surfaces as a clear error if ever hit.
+
+**Read flow (internal):**
+
+```mermaid
+flowchart TD
+    A[read_note path] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path to doc ID]
+    C --> D[GET note doc from CouchDB]
+    D --> E{found?}
+    E -- 404 --> Y[NoteNotFoundError]
+    E -- yes --> F{deleted: true?}
+    F -- yes --> Y
+    F -- no --> G[_bulk_get all child chunk docs]
+    G --> H{any chunk encrypted?}
+    H -- yes --> I[decrypt each with passphrase]
+    H -- no --> J
+    I --> J{any chunk compressed?}
+    J -- yes --> K[deflate-decompress each]
+    J -- no --> L
+    K --> L[concatenate chunks in children-array order]
+    L --> M[return Note]
+```
+
+### `create_note`
+
+Create a new note. Fails if a non-deleted note already exists at the path.
+A soft-deleted note at the path is silently overwritten (resurrected),
+matching the LiveSync plugin's own behavior.
+
+```python
+class CreateNoteInput(BaseModel):
+    """Create a new note. Fails if a live note already exists at the path."""
+
+    path: str = Field(
+        description=(
+            "Path where the new note will be created, relative to vault root. "
+            "Must end in '.md'. Must not already exist (a soft-deleted note "
+            "at the same path is fine — it will be transparently overwritten). "
+            "Parent folders are implicit; writing 'projects/new/notes.md' "
+            "works even if 'projects/new/' is otherwise empty. "
+            "Forward slashes only, case-sensitive."
+        ),
+    )
+    content: str = Field(
+        description=(
+            "Initial markdown content of the note. May be empty. "
+            "May include YAML frontmatter at the top. "
+            "Transparently chunked, compressed, and encrypted on write."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model. `ctime == mtime` (both set to now, UTC).
+
+**Errors:**
+- `NoteAlreadyExistsError` — a non-deleted note already exists at the path.
+  The LLM should use `update_note` (or `delete_note` then `create_note`)
+  to replace it intentionally.
+- `InvalidPathError` — empty, leading slash, contains `..`, doesn't end
+  in `.md`, or contains characters Obsidian rejects (`\`, `:`, `*`, `?`,
+  `"`, `<`, `>`, `|`).
+
+**Behavior with soft-deleted ghosts (matches LiveSync plugin):**
+- Reuse the existing doc's `_id` and chain off its `_rev`.
+- Clear the `deleted` flag by writing a new revision without it.
+- Discard the old chunk references; the plugin's
+  `purgeUnreferencedChunks` maintenance task will GC orphaned chunks.
+- Treat `ctime` as fresh — set to "now," not inherited from the tombstone.
+
+This is exactly what the plugin does (see
+`src/lib/src/managers/EntryManager/EntryManagerImpls.ts:197-220`), so our
+writes are indistinguishable from a LiveSync client's.
+
+```mermaid
+flowchart TD
+    A[create_note path, content] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path → doc ID]
+    C --> D[GET existing doc]
+    D --> E{exists?}
+    E -- no --> G[prepare new doc<br/>ctime=mtime=now]
+    E -- yes --> F{deleted: true?}
+    F -- no --> Y[NoteAlreadyExistsError]
+    F -- yes --> G2[prepare new doc<br/>reuse _id, chain off old _rev<br/>ctime=mtime=now, clear deleted]
+    G --> H
+    G2 --> H[split content into chunks]
+    H --> I{encryption enabled?}
+    I -- yes --> J[encrypt each chunk]
+    I -- no --> K
+    J --> K{compression enabled?}
+    K -- yes --> L[deflate each chunk]
+    K -- no --> M
+    L --> M[hash each chunk → 'h:' IDs]
+    M --> N[_bulk_docs: write chunks + parent doc]
+    N --> O{409 conflict?}
+    O -- yes, retries < 3 --> D
+    O -- yes, exhausted --> Z[NoteWriteError]
+    O -- no --> P[Return Note]
+```
+
+### `update_note`
+
+Overwrite an existing note's content. Strict — fails if the note doesn't
+exist (use `create_note` for that). A soft-deleted note at the path is
+treated as "not found" for consistency with `read_note`.
+
+```python
+class UpdateNoteInput(BaseModel):
+    """Update an existing note's content. Strict — does not create new notes."""
+
+    path: str = Field(
+        description=(
+            "Path of the note to update, relative to vault root. "
+            "Must point to an existing, non-deleted note. "
+            "Use create_note for new notes; soft-deleted notes are not "
+            "considered to exist for the purposes of this tool."
+        ),
+    )
+    content: str = Field(
+        description=(
+            "New full markdown content. Replaces the entire note body. "
+            "May be empty. May include YAML frontmatter, verbatim. "
+            "Transparently chunked, compressed, and encrypted on write."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model — `ctime` preserved from the original,
+`mtime` set to now.
+
+**Errors:**
+- `NoteNotFoundError` — path doesn't exist, or note is soft-deleted.
+  Use `create_note` to write a new (or resurrected) note at this path.
+- `InvalidPathError` — path is malformed.
+- `NoteWriteError` — internal: retried writes hit 409 N times in a row.
+
+**Behavior:**
+- `ctime` is preserved; `mtime` is bumped to now.
+- Old chunks become orphans; LiveSync's `purgeUnreferencedChunks` GC's them.
+- No conditional update (no `expected_mtime`); 409s are handled by an
+  internal retry loop. We can revisit if real concurrency issues surface.
+- No-op writes (new content == old content) still go through — the
+  caller asked for a write, `mtime` bump is a real signal.
+- Structurally identical to `create_note` at the DB layer; only the
+  preconditions differ.
+
+| Precondition | `create_note` | `update_note` |
+|---|---|---|
+| Doc doesn't exist | ✓ proceed | ✗ NoteNotFoundError |
+| Doc exists, not deleted | ✗ AlreadyExists | ✓ proceed |
+| Doc exists, soft-deleted | ✓ proceed (resurrect) | ✗ NoteNotFoundError |
+
+```mermaid
+flowchart TD
+    A[update_note path, content] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path → doc ID]
+    C --> D[GET existing doc]
+    D --> E{exists?}
+    E -- no --> Y[NoteNotFoundError]
+    E -- yes --> F{deleted: true?}
+    F -- yes --> Y
+    F -- no --> G[prepare updated doc<br/>preserve ctime, mtime=now<br/>chain off current _rev]
+    G --> H[split new content into chunks]
+    H --> I{encryption enabled?}
+    I -- yes --> J[encrypt each chunk]
+    I -- no --> K
+    J --> K{compression enabled?}
+    K -- yes --> L[deflate each chunk]
+    K -- no --> M
+    L --> M[hash each chunk → 'h:' IDs]
+    M --> N[_bulk_docs: write new chunks + parent doc]
+    N --> O{409 conflict?}
+    O -- yes, retries < 3 --> D
+    O -- yes, exhausted --> Z[NoteWriteError]
+    O -- no --> P[Return Note]
+```
+
+### `delete_note`
+
+Soft-delete a note. The doc remains in CouchDB with `deleted: true`,
+matching LiveSync's normal delete behavior. The deletion can be undone
+later by calling `create_note` at the same path (resurrection).
+
+```python
+class DeleteNoteInput(BaseModel):
+    """Soft-delete a note. The doc remains in CouchDB as a tombstone."""
+
+    path: str = Field(
+        description=(
+            "Path of the note to delete, relative to vault root. "
+            "Must point to an existing, non-deleted note. "
+            "After deletion, read_note and list_notes will treat this "
+            "path as not-existing. The deletion can later be undone by "
+            "calling create_note at the same path (resurrection)."
+        ),
+    )
+
+
+class DeleteNoteOutput(BaseModel):
+    """Confirmation that a note has been soft-deleted."""
+
+    path: str = Field(
+        description="Path of the deleted note (echoed from input).",
+    )
+    deleted: bool = Field(
+        default=True,
+        description=(
+            "Always true on success. Included for clarity so the LLM "
+            "has an unambiguous confirmation field rather than an empty body."
+        ),
+    )
+```
+
+**Errors:**
+- `NoteNotFoundError` — path doesn't exist, or note is already soft-deleted.
+  The end state is the same either way, but the error signals stale state
+  to the LLM.
+- `InvalidPathError` — path is malformed.
+- `NoteWriteError` — retried writes hit 409 N times in a row.
+
+**Behavior:**
+- Uses LiveSync's `deleted: true` flag, not CouchDB's native `_deleted`.
+  The doc lives on; LiveSync's maintenance task GC's orphan chunks later.
+- The `children` array is **preserved** on delete. Two reasons:
+  reversibility (a replica with intact chunks can restore the note via
+  replication), and there's no correctness benefit to clearing it.
+- `ctime` is preserved; `mtime` is bumped to the deletion time.
+- No `purge` option. CouchDB `_purge` is a maintenance operation, not an
+  LLM-accessible action.
+
+```mermaid
+flowchart TD
+    A[delete_note path] --> B{path syntactically valid?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[encode path → doc ID]
+    C --> D[GET existing doc]
+    D --> E{exists?}
+    E -- no --> Y[NoteNotFoundError]
+    E -- yes --> F{deleted: true?}
+    F -- yes --> Y
+    F -- no --> G[prepare tombstone doc<br/>set deleted=true, mtime=now<br/>preserve children & ctime<br/>chain off current _rev]
+    G --> H[PUT updated doc to CouchDB]
+    H --> I{409 conflict?}
+    I -- yes, retries < 3 --> D
+    I -- yes, exhausted --> Z[NoteWriteError]
+    I -- no --> J[Return DeleteNoteOutput]
+```
+
+Much simpler than create/update at the DB layer — no chunking, no
+encryption, no compression. Just one doc update.
+
+### `move_note`
+
+Rename or relocate a note. Internally a "create at new path, delete at
+old path" sequence. From the LLM's perspective: one call, one result.
+
+**What the LiveSync plugin does:** when an Obsidian user renames a file,
+the plugin's `watchVaultRename` (in `StorageEventManager.ts:636-656`)
+queues a DELETE then a CREATE — there is no dedicated rename op at the
+DB layer. `ctime` is taken from the file's post-rename filesystem stat,
+which means it's *fresh*, not preserved from the original. Chunks
+deduplicate naturally because chunk IDs are content-hash-derived, so
+identical content → identical chunks → existing chunks get reused.
+
+**What we do:** mirror the plugin's *result* exactly (fresh `ctime`, no
+special metadata, natural chunk dedup) but **reverse the order**:
+create-then-delete instead of delete-then-create. The plugin's
+delete-then-create order is safe because it queues both ops together
+in a persistent local queue that retries across crashes. We don't have
+that infrastructure, so the safer order — where worst-case partial
+failure leaves a duplicate (recoverable) instead of a hole (data loss)
+— is the right call.
+
+```python
+class MoveNoteInput(BaseModel):
+    """Move or rename a note. Bumps mtime; ctime is fresh (matches plugin)."""
+
+    old_path: str = Field(
+        description=(
+            "Current path of the note. Must point to an existing, "
+            "non-deleted note. Forward slashes, case-sensitive."
+        ),
+    )
+    new_path: str = Field(
+        description=(
+            "Destination path. Must end in '.md'. Must not already exist "
+            "(soft-deleted notes at this path are fine — they'll be "
+            "overwritten, matching create_note's resurrect behavior). "
+            "Parent folders are implicit. Backlinks pointing to old_path "
+            "elsewhere in the vault will NOT be updated — they'll break, "
+            "exactly as if a user renamed the file outside Obsidian."
+        ),
+    )
+```
+
+**Output:** the shared `Note` model — content unchanged, `path` =
+`new_path`, `ctime` and `mtime` both = now (matching the plugin).
+
+**Errors:**
+- `NoteNotFoundError` — `old_path` doesn't exist or is soft-deleted.
+- `NoteAlreadyExistsError` — `new_path` exists and is not soft-deleted.
+- `InvalidPathError` — either path is malformed, OR `old_path == new_path`.
+- `MovePartialFailureError` — the create at `new_path` succeeded but the
+  delete at `old_path` failed. Error includes both paths so the LLM
+  knows the note now exists at both and can call `delete_note(old_path)`
+  itself to clean up.
+
+```mermaid
+flowchart TD
+    A[move_note old_path, new_path] --> B{both paths valid<br/>and different?}
+    B -- no --> X[InvalidPathError]
+    B -- yes --> C[GET old doc]
+    C --> D{old exists and not deleted?}
+    D -- no --> Y[NoteNotFoundError]
+    D -- yes --> E[GET new doc]
+    E --> F{new exists and not deleted?}
+    F -- yes --> Z[NoteAlreadyExistsError]
+    F -- no --> G[create_note flow at new_path<br/>with old content, fresh ctime/mtime]
+    G --> H{create succeeded?}
+    H -- no --> W[propagate create error]
+    H -- yes --> I[delete_note flow at old_path]
+    I --> J{delete succeeded?}
+    J -- no --> V[MovePartialFailureError<br/>note now at both paths]
+    J -- yes --> K[Return new Note]
+```
+
+**Why not "in-place rename" (just change `path` on the doc)?**
+LiveSync's doc IDs are derived from path (see `livesync/paths.py`), so
+"renaming" means writing a new doc at a new ID anyway — CouchDB can't
+change a doc's `_id`. It's create + delete with extra steps.
+
+### `semantic_search`
+
+Vector similarity search over indexed note chunks. The index is maintained
+in the background by a `_changes` subscriber (see Vector index requirements);
+the LLM never triggers indexing directly. Folder filtering is intentionally
+omitted from the first cut — the LLM can call `list_notes` for scoped
+browsing, and `semantic_search` is meant for vault-wide semantic discovery.
+
+```python
+class SemanticSearchInput(BaseModel):
+    """Search the vault using semantic (vector) similarity."""
+
+    query: str = Field(
+        min_length=1,
+        max_length=2000,
+        description=(
+            "Search query: phrase, question, or keywords. "
+            "The query is embedded and matched against indexed note chunks. "
+            "Examples: 'project planning tips', 'how to set goals'."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum results to return. Defaults to 5; cap is 50. "
+            "One note may appear multiple times if it has multiple "
+            "matching sections (each is a separate chunk)."
+        ),
+    )
+
+
+class SearchHit(BaseModel):
+    """A single search result — a matched text chunk with context."""
+
+    path: str = Field(
+        description="Path of the note containing this match.",
+    )
+    heading: str | None = Field(
+        description=(
+            "Nearest markdown heading above the match "
+            "(e.g., '# Title' or '## Subsection'). "
+            "None if the match appears before any heading."
+        ),
+    )
+    snippet: str = Field(
+        description=(
+            "Matched text snippet (first ~200 characters of the chunk). "
+            "Exact boundaries depend on chunking and the vector store."
+        ),
+    )
+    score: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Similarity score, normalized to [0, 1]. 1.0 is highest "
+            "relevance. Exact interpretation depends on the embedding "
+            "model and distance metric."
+        ),
+    )
+    mtime: datetime = Field(
+        description="Last modification time of the note (ISO 8601, UTC).",
+    )
+    size_bytes: int = Field(
+        ge=0,
+        description="Plaintext size of the note in bytes (UTF-8).",
+    )
+
+
+class IndexCoverage(BaseModel):
+    """Coverage statistics of the semantic search index."""
+
+    indexed: int = Field(
+        ge=0,
+        description=(
+            "Number of notes currently indexed and searchable. "
+            "May be less than total if indexing is still in progress."
+        ),
+    )
+    total: int = Field(
+        ge=0,
+        description=(
+            "Total notes in the vault. If indexed < total, the index "
+            "is still being built and results may be incomplete."
+        ),
+    )
+
+
+class SemanticSearchOutput(BaseModel):
+    """Results of a semantic search query."""
+
+    results: list[SearchHit] = Field(
+        description=(
+            "Matched chunks ranked by score (highest first). "
+            "May be fewer than top_k. Empty if nothing matched, or if "
+            "the index is not yet built — check index_coverage to tell "
+            "those cases apart."
+        ),
+    )
+    index_coverage: IndexCoverage = Field(
+        description=(
+            "Index status. If indexed < total, the index is still "
+            "building; some notes may not yet be searchable."
+        ),
+    )
+```
+
+**Errors:** none under normal operation. Empty `results` with honest
+`index_coverage` covers both "no matches" and "index not ready."
+
+**Behavior:**
+- The vector index is updated continuously by a background subscriber to
+  the CouchDB `_changes` feed. The LLM does not (and cannot) trigger
+  indexing through MCP.
+- Returns up to `top_k` chunks. Multiple chunks from the same note are
+  allowed and not deduplicated — each represents a distinct semantic match.
+- `heading` is best-effort: derived from the chunk's position within the
+  reassembled note. None is returned if the chunk precedes any heading.
+- `mtime` and `size_bytes` are read from the parent note doc at query
+  time (or cached alongside the vector); they reflect the note's current
+  state, not the state at index time.
+
+```mermaid
+flowchart TD
+    A[semantic_search query, top_k] --> B[embed query with configured backend]
+    B --> C[vector store: nearest top_k chunk vectors]
+    C --> D[for each hit: load parent note metadata]
+    D --> E[derive nearest heading for each chunk]
+    E --> F[count total notes and indexed notes]
+    F --> G[Return results + index_coverage]
+```
+
+### `read_notes`
+
+Batch variant of `read_note`. Each path is attempted independently; a
+missing or unreadable note does **not** fail the whole call — it's
+reported per-path in the result. Useful when the LLM has a known set
+of paths (e.g. from `get_backlinks` or a folder listing) and wants
+their content in one round trip.
+
+```python
+class ReadNotesInput(BaseModel):
+    """Read multiple notes in one call. Per-path errors don't fail the batch."""
+
+    paths: list[str] = Field(
+        description=(
+            "Paths of notes to read, relative to vault root. "
+            "Paths are case-sensitive and use forward slashes. "
+            "An empty list returns an empty result."
+        ),
+    )
+
+
+class NoteReadError(BaseModel):
+    """Error details when reading a single note in a batch fails."""
+
+    path: str = Field(description="The path that could not be read.")
+    error: str = Field(
+        description="Error message (e.g. 'not found', 'decryption failed').",
+    )
+
+
+class BatchReadOutput(BaseModel):
+    """Results of reading multiple notes at once."""
+
+    notes: dict[str, NoteModel | NoteReadError] = Field(
+        description=(
+            "Results keyed by path. Value is either a Note (success) or "
+            "a NoteReadError (failure). Every requested path appears."
+        ),
+    )
+    succeeded: int = Field(ge=0, description="Number of notes successfully read.")
+    failed: int = Field(ge=0, description="Number of notes that failed to read.")
+```
+
+**Errors:** none at the batch level — individual failures are captured
+in `notes[path]` as `NoteReadError`.
+
+### `append_note`
+
+Append content to the end of an existing note. Safer than
+`read_note` + `update_note` for incremental writes (e.g. journal /
+log notes): the read-modify-write happens server-side in one call,
+so the LLM can't accidentally clobber concurrent changes by writing
+back stale content.
+
+```python
+class AppendNoteInput(BaseModel):
+    """Append content to the end of an existing note."""
+
+    path: str = Field(description="Path of the note to append to.")
+    content: str = Field(description="Content to append.")
+    separator: str = Field(
+        default="\n",
+        description=(
+            "String inserted between existing content and the appended content. "
+            "Default is a single newline; use '\\n\\n' for a blank-line gap."
+        ),
+    )
+
+
+class AppendNoteOutput(NoteModel):
+    """Result of an append: the full updated note plus how many bytes were added."""
+
+    appended_bytes: int = Field(
+        ge=0,
+        description=(
+            "Number of bytes appended (separator + content, UTF-8 encoded). "
+            "Useful for confirming the write took effect."
+        ),
+    )
+```
+
+**Errors:**
+- `NoteNotFoundError` — note doesn't exist. Use `create_note` instead.
+- `InvalidPathError` — path is malformed.
+
+### `keyword_search`
+
+Literal-string or regex search over note content, returning matched
+lines with line numbers and snippets. Complements `semantic_search`:
+keyword for "find exact text I remember writing", semantic for "find
+notes about a topic". Iterates over live notes, decrypting on the fly.
+
+```python
+class KeywordSearchInput(BaseModel):
+    """Search note content for a literal string or regex pattern."""
+
+    pattern: str = Field(
+        min_length=1,
+        description=(
+            "Search term. If regex=False, treated as a literal string "
+            "(special regex characters are escaped). If regex=True, "
+            "treated as a regular expression."
+        ),
+    )
+    case_sensitive: bool = Field(
+        default=False,
+        description="If True, match exact case. Default is case-insensitive.",
+    )
+    regex: bool = Field(
+        default=False,
+        description=(
+            "If True, interpret pattern as a regex. Invalid regex raises "
+            "an error rather than returning empty results."
+        ),
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Restrict search to notes under this prefix (e.g. 'projects/').",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Maximum matches to return (default 100, cap 1000).",
+    )
+
+
+class KeywordMatch(BaseModel):
+    """A single match in keyword search results."""
+
+    path: str = Field(description="Path of the note containing the match.")
+    line_number: int = Field(
+        ge=1,
+        description="Line number of the match (1-indexed).",
+    )
+    snippet: str = Field(
+        description=(
+            "The matched line, trimmed and truncated to ~200 characters. "
+            "Long lines end with '...' to indicate truncation."
+        ),
+    )
+
+
+class KeywordSearchOutput(BaseModel):
+    """Results of a keyword/regex search."""
+
+    matches: list[KeywordMatch] = Field(
+        description="Matches in scan order (notes lexicographic, then line order).",
+    )
+    total_matches: int = Field(
+        ge=0,
+        description=(
+            "Total matches found (may exceed len(matches) if truncated by limit)."
+        ),
+    )
+```
+
+**Errors:**
+- `LiveSyncMCPError` — invalid regex when `regex=True`.
+
+**Behavior:**
+- Empty `pattern` returns empty results (no error).
+- Iterates all live notes filtered by `path_prefix`; decryption errors
+  on individual notes are skipped silently.
+
+### `get_forward_links`
+
+Return notes that this note links to (outgoing `[[wikilinks]]`).
+Backed by an in-memory `LinkGraph` that's backfilled on server startup
+and kept fresh by the `_changes` subscriber, so queries are O(1) and
+the graph reflects the vault as of the most recent edit.
+
+```python
+class GetForwardLinksInput(BaseModel):
+    """Notes that this note links to."""
+
+    path: str = Field(description="Path of the note to query.")
+
+
+class LinkSearchOutput(BaseModel):
+    """Result of a forward-links or backlinks query."""
+
+    path: str = Field(description="The note path queried (echoed from input).")
+    forward_links: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Wikilink targets referenced by this note. Targets are basenames "
+            "as written in the [[...]] — they are NOT resolved to full paths "
+            "in this v1. Sorted alphabetically."
+        ),
+    )
+    backlinks: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Always empty for this tool — use `get_backlinks` or `get_links`."
+        ),
+    )
+```
+
+**Errors:** none. Unknown / missing paths return an empty list rather than raising.
+
+### `get_backlinks`
+
+Return notes that reference this note (incoming `[[wikilinks]]`).
+Same graph as `get_forward_links`. The query argument can be a full
+path or a bare basename — pass whatever appears between the `[[ ]]`
+brackets in the linking notes.
+
+```python
+class GetBacklinksInput(BaseModel):
+    """Notes that reference this note via [[wikilinks]]."""
+
+    path: str = Field(
+        description=(
+            "Path or basename of the note to query. Matches the target as "
+            "it appears between [[...]] in source notes."
+        ),
+    )
+
+
+# Output: shared LinkSearchOutput (see get_forward_links).
+# `backlinks` is populated; `forward_links` is empty.
+```
+
+**Errors:** none. Unknown / missing paths return an empty list rather than raising.
+
+### `get_links`
+
+Both forward and backlinks in a single call. Convenient when the LLM
+wants a full picture of a note's place in the graph and would
+otherwise issue two consecutive calls.
+
+```python
+class GetLinksInput(BaseModel):
+    """Both forward and backlinks for a note."""
+
+    path: str = Field(description="Path of the note to query.")
+
+
+# Output: shared LinkSearchOutput with both forward_links and backlinks populated.
+```
+
+**Errors:** none.
+
+### `recent_changes`
+
+Query the CouchDB `_changes` feed for vault modifications (create /
+update / delete events). Two filter modes:
+
+- **`since_seq: int`** — CouchDB sequence number. Preferred for
+  reliable resumable polling: no clock skew, no missed events. Save
+  the `watermark_seq` from each response and pass it as `since_seq`
+  on the next call.
+- **`since: str`** — human-friendly timestamp: relative (`"1h"`,
+  `"30m"`, `"7d"`) or ISO 8601 (`"2026-05-19T00:00:00Z"`). Falls back
+  to comparing `mtime`; sensitive to clock skew across devices.
+
+If both are given, `since_seq` wins.
+
+```python
+class RecentChangesInput(BaseModel):
+    """Query recent vault changes from the CouchDB _changes feed."""
+
+    since_seq: int | None = Field(
+        default=None,
+        description=(
+            "CouchDB sequence number to start from. Preferred for resumable "
+            "polling. If both since_seq and since are given, since_seq wins."
+        ),
+    )
+    since: str | None = Field(
+        default=None,
+        description=(
+            "Timestamp filter: '1h', '30m', '7d' (relative) or ISO 8601 "
+            "(e.g. '2026-05-19T00:00:00Z'). Uses mtime — clock-skew sensitive. "
+            "Prefer since_seq when possible."
+        ),
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Restrict to notes under this prefix.",
+    )
+    include_deleted: bool = Field(
+        default=True,
+        description="If False, omit soft-deleted notes from results.",
+    )
+    change_types: list[str] | None = Field(
+        default=None,
+        description=(
+            "Filter by type: subset of ['create', 'update', 'delete']. "
+            "None means all types."
+        ),
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Max events to return (default 100, cap 1000).",
+    )
+
+
+class ChangeItem(BaseModel):
+    """A single change event."""
+
+    path: str = Field(description="Path of the note affected.")
+    change_type: str = Field(description="'create', 'update', or 'delete'.")
+    mtime: datetime = Field(description="Timestamp of the change (ISO 8601, UTC).")
+    deleted: bool = Field(
+        description="True if soft-deleted. False otherwise.",
+    )
+    seq: int = Field(
+        description=(
+            "CouchDB sequence number. Use the highest seen as `since_seq` "
+            "on the next poll."
+        ),
+    )
+    size_bytes: int | None = Field(
+        default=None,
+        description="Size of the note in bytes (None for deleted notes).",
+    )
+
+
+class RecentChangesOutput(BaseModel):
+    """Results of a recent-changes query."""
+
+    changes: list[ChangeItem] = Field(
+        description="Changes matching the query, most recent first (by seq).",
+    )
+    watermark_seq: int = Field(
+        description=(
+            "Highest sequence number in the results. Pass this as "
+            "`since_seq` on the next call for incremental updates."
+        ),
+    )
+    total_available: int = Field(
+        ge=0,
+        description=(
+            "Total matches before the limit was applied. If "
+            "total_available > len(changes), results were truncated."
+        ),
+    )
+    truncated: bool = Field(
+        description=(
+            "True if more results exist beyond the limit. Re-poll with "
+            "the returned watermark_seq for the next batch."
+        ),
+    )
+```
+
+**Errors:** none under normal operation. Network failures from the
+underlying `_changes` request surface as the typed CouchDB errors used
+elsewhere.
+
+**Behavior:**
+- The MCP tool runs a one-shot `feed=normal` query — it doesn't share
+  the long-lived `_changes` stream used by the LinkGraph subscriber.
+- Results are sorted by seq descending (most recent first) before the
+  limit is applied, so truncation drops the oldest events.
+
+---
+
+## Architecture sketch
+
+```
+                                          ┌─────────────────────────┐
+                                          │       MCP client        │
+                                          │  (Claude Desktop, etc.) │
+                                          └────────────┬────────────┘
+                                                       │  MCP (stdio/http)
+                                          ┌────────────▼────────────┐
+                                          │   obsidian_livesync_mcp │
+                                          │  ┌───────────────────┐  │
+                                          │  │   server.py       │  │  ← MCP entry
+                                          │  └─────────┬─────────┘  │
+                                          │  ┌─────────▼─────────┐  │
+                                          │  │   tools/          │  │  ← MCP tool handlers
+                                          │  └─────────┬─────────┘  │
+                                          │  ┌─────────▼─────────┐  │
+                                          │  │  livesync/        │  │  ← schema, chunks,
+                                          │  │   paths, chunks,  │  │     encryption, paths
+                                          │  │   notes, crypto   │  │
+                                          │  └─────────┬─────────┘  │
+                                          │  ┌─────────▼─────────┐  │
+                                          │  │   couchdb.py      │  │  ← HTTP client
+                                          │  └─────────┬─────────┘  │
+                                          └────────────┼────────────┘
+                                                       │  HTTP
+                                          ┌────────────▼────────────┐
+                                          │        CouchDB          │
+                                          │  (the LiveSync database)│
+                                          └─────────────────────────┘
+
+                                  ┌──────────────────┐
+                                  │   vector/        │
+                                  │   indexer.py     │  subscribes to _changes,
+                                  │   store.py       │  writes to vector DB
+                                  └──────────────────┘
+
+                                  ┌──────────────────┐
+                                  │  livesync/       │
+                                  │  links.py        │  in-memory LinkGraph;
+                                  │  recent_changes  │  forward + back links,
+                                  │                  │  fed by _changes feed
+                                  └──────────────────┘
+```
+
+**Background tasks.** On startup, `server.py` backfills the `LinkGraph`
+by reading every note in the vault. While the server runs, a single
+`_changes` subscriber (`feed=continuous`, `since=graph.seq`) keeps the
+graph in sync with vault edits. The subscriber also tracks the watermark
+sequence; when the connection drops, it reconnects from the last seq.
+The same `_changes` feed will eventually feed the vector indexer
+(currently stubbed). The `recent_changes` MCP tool runs its own one-shot
+`feed=normal` query — it doesn't share the subscriber's stream.
+
+## Deferred / backburner
+
+- **Local read cache.** A small SQLite cache keyed by `(path, rev)` storing
+  decoded note content would skip the chunk-fetch + decompress + decrypt
+  pipeline on repeated reads. Mostly worthwhile when the MCP server runs
+  on a different machine from CouchDB and round-trip latency is non-trivial;
+  for a co-located deployment the savings are negligible. Revisit if
+  profiling shows reads are a bottleneck.
+- **PouchDB-style local replica.** Explicitly rejected: PouchDB is JS-only,
+  bridging it from Python is expensive, and we don't need the offline /
+  conflict-resolution features it provides. A targeted cache (above) covers
+  the realistic performance need.
+
+## Known gaps & compatibility risks
+
+Tracked here so we don't lose them. These all need resolution before we
+can claim full round-trip compatibility with the LiveSync plugin.
+
+### Resolved via real-vault integration testing
+
+Read-side compatibility has now been validated byte-for-byte against
+real plugin exports in three configurations — plain, E2EE, and E2EE +
+Path Obfuscation + Property Encryption (see
+`tests/test_integration_{plain,encrypted,obfuscated}.py`):
+
+- **Encryption: V2 HKDF — verified against real vaults.** Every encrypted
+  chunk in the real E2EE and obfuscated exports decrypts with our PBKDF2
+  salt + HKDF derivation, and re-hashes to the plugin's exact `h:+` chunk
+  ID. Encrypted chunk IDs mix in a per-vault `hashedPassphrase`
+  (octagonal-wheels `fallbackMixedHashEach`: MurmurHash3 + FNV-1a):
+  `xxhash64(plaintext + "-" + hashedPassphrase + "-" + utf16_len)`.
+- **Path obfuscation hashing — resolved.** The `path.ts` "stretching" loop
+  is an upstream no-op (it re-hashes the *original* buffer each iteration),
+  so the obfuscated ID collapses to a single SHA-256:
+  `f: + sha256(sha256(passphrase) + ":" + lower(path))`. Verified against
+  all 38 `f:` IDs in the real obfuscated export.
+- **Property Encryption — supported.** With obfuscation on, the plugin
+  zeroes the top-level note fields and stores real `{path, mtime, ctime,
+  size, children}` as an HKDF blob in the `path` field (marker `/\:` +
+  `%=`). `NoteRepository` auto-detects and decrypts this, so `read()` /
+  `list_paths()` work transparently. Uses the same passphrase/salt as
+  content E2EE — no extra config knob.
+
+### Hard limitations of the MVP
+
+- **Encryption: V2 HKDF only.** Legacy `%` (PBKDF2) and `%~` (V3) chunks
+  raise `EncryptionNotSupportedError`. Ephemeral salt (`%$`) is decoded
+  for reads only.
+
+### Unresolved spec questions (need real-vault verification)
+
+- **Compression marker.** Two markers appear in the TS source: `~`
+  (referenced widely in older code) and `\u{000E}LZ\u{001D}`
+  (`MARK_SHIFT_COMPRESSED` in current `compress.ts`). The relationship —
+  whether one supersedes the other, or they coexist on different code
+  paths — is not obvious. Our writes should match whichever marker the
+  plugin currently produces for new chunks. Verify with a real vault.
+
+- **HKDF parameters — verified against a real vault.** Parameters traced
+  from `octagonal-wheels/src/encryption/hkdf.ts`: PBKDF2-HMAC-SHA256
+  (310 000 iter, 32-byte salt), HKDF-SHA256 with empty `info` and 32-byte
+  salt, AES-GCM-256 with 12-byte IV and appended 16-byte tag, layout
+  `iv[12] || hkdf_salt[32] || ct+tag`. Confirmed by decrypting every chunk
+  in the real E2EE and obfuscated exports (Python ↔ plugin interop).
+
+- **Hash algorithm selection.** The plugin supports XXHash64 (default),
+  SHA1, and a pure-JS mixed hash. We implement XXHash64 only. If a user
+  has an unusual config, our chunk IDs won't match theirs and chunk
+  dedup with their existing data will silently fail. Detect and refuse
+  to write in that case, or document the requirement.
+
+- **Eden field.** Plugin sets `eden: {}` on unencrypted writes; the
+  encryption layer populates it on encrypted writes. We always write
+  `{}`. Should be fine for non-encrypted vaults but verify nothing in
+  the plugin's read path expects a specific shape.
+
+### Verification deferred
+
+- **Write-side round-trip against a live plugin.** Read-side integration
+  tests now run the real `NoteRepository` against actual plugin exports
+  (plain / E2EE / obfuscated+Property-Encryption) and verify our re-split
+  of decrypted content reproduces the plugin's chunk IDs exactly — strong
+  evidence our *writes* will dedup correctly. Still outstanding: a live
+  round-trip where the plugin reads back notes this server *wrote* to a
+  shared CouchDB (especially encrypted/obfuscated writes and the `eden`
+  field shape).
+
+## Open questions
+
+- **Vector store choice.** Embedded (sqlite-vec, Chroma persistent, LanceDB)
+  is simpler for self-hosting; server (Qdrant, Weaviate) scales better.
+  Default to embedded; make it pluggable.
+- **Embedding backend default.** OpenAI's `text-embedding-3-small` is cheap
+  and good, but requires an API key. A local default (sentence-transformers
+  or Ollama) avoids that but adds heavy dependencies. Probably ship without
+  a default and require explicit config.
+- **Chunking granularity for embeddings.** Per-note? Per-heading section?
+  Per-paragraph with overlap? Probably per-heading with a fallback to
+  fixed-size windows for long sections.
+- **Write-side LiveSync compatibility.** Our writes need to be readable by
+  the official LiveSync plugin without trouble. This means matching their
+  `eden` field semantics and chunk hashing exactly. To be verified with
+  round-trip tests against a real vault.
+
+## Reference
+
+- The TypeScript source under `src/lib/` (the `livesync-commonlib`
+  submodule) is the canonical reference for the on-disk schema.
+- Key files when in doubt:
+  - `src/lib/src/common/models/db.type.ts` — document type definitions.
+  - `src/lib/src/string_and_binary/path.ts` — path ↔ ID encoding.
+  - `src/lib/src/pouchdb/encryption.ts` — encryption.
+  - `src/lib/src/ContentSplitter/` — chunking.
+  - `src/lib/src/managers/EntryManager/EntryManagerImpls.ts` — read/write
+    note assembly logic.

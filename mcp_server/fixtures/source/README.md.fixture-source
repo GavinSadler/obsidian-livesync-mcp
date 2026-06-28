@@ -1,0 +1,55 @@
+# Fixture source vault
+
+> Renamed to `README.md.fixture-source` so it is **not** itself imported as a
+> vault note (that slot belongs to the fixture `README.md` below). Read this
+> file; do not sync it.
+
+This directory is the **source of truth** for the three exported fixtures under
+`mcp_server/fixtures/{plain,encrypted,obfuscated}/`. Those fixtures are
+`_all_docs` dumps of a real Obsidian LiveSync CouchDB; this is the `.md` vault
+they were built from, so they can be regenerated deterministically.
+
+It is the vault we hand-built (7 feature notes + 1 tombstone note) layered on
+top of the stock Obsidian demo vault (`Adventurer/`, `Formatting/`, `Guides/`,
+etc.), which supplies realistic volume, nested folders, and spaced paths.
+
+## What each hand-built note exercises
+
+| Note | Requirement it covers |
+|------|----------------------|
+| `README.md` | YAML frontmatter parsing; case-insensitive path resolution (`_id` `readme.md` vs `path` `README.md`) |
+| `note-with-links.md` | Forward wikilink extraction, incl. aliased `[[note\|alias]]` |
+| `linked-note.md` | Backlink target (reverse link graph) |
+| `compressible-note.md` | Deflate compression round-trip |
+| `multi-chunk-note.md` | Multi-chunk split (>50 chunks) + in-order reassembly + chunk-ID hashing |
+| `note-with-emoji.md` | UTF-16 surrogate pairs, CJK, ZWJ sequences, chunk-boundary safety |
+| `test123.md` | Tiny single-chunk note |
+| `deleted-note.md` | **Soft-delete** — delete it after first sync so the export has a tombstone |
+
+Subfolder + spaced-path coverage comes from the demo vault (e.g.
+`Formatting/Code block.md`).
+
+## Rebuild & re-export procedure
+
+Do this once per config — `plain`, `encrypted`, `obfuscated` — each into its own
+throwaway CouchDB database.
+
+1. **Import** this directory as an Obsidian vault (copy the `.md` files into a
+   fresh vault folder; do not copy this `README.md.fixture-source`).
+2. **Configure LiveSync** for the target config and point it at an empty DB:
+   - `plain` — E2EE **off**, Path Obfuscation **off**.
+   - `encrypted` — E2EE **on**, Path Obfuscation **off**.
+   - `obfuscated` — E2EE **on**, Path Obfuscation **on** (enables Property
+     Encryption of the metadata blob).
+   - Passphrase for both encrypted configs: `ThisIsMyObsidianNotebook1234`
+3. **Sync** (replicate) so every note + chunk lands in CouchDB.
+4. **Create the tombstone:** delete `deleted-note.md` in Obsidian, then sync
+   again. LiveSync writes `deleted: true` rather than purging, so the export
+   captures it.
+5. **Export** from CouchDB into the matching fixture dir:
+   - `all_docs.json` ← `GET /<db>/_all_docs?include_docs=true`
+   - `sync_parameters.json` ← `GET /<db>/_local/obsidian_livesync_sync_parameters`
+     (carries `pbkdf2salt` + `protocolVersion`; required for decryption)
+
+`scripts/load_fixture.py` reads these back; the integration tests
+(`tests/test_integration_{plain,encrypted,obfuscated}.py`) validate them.
